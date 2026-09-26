@@ -905,6 +905,8 @@
 
     window.addEventListener('resize', function () { drawView(); });
     window.addEventListener('orientationchange', function () { setTimeout(drawView, 260); });
+    /* 抽屉展开 / 收起会改变预览行高度，用 ResizeObserver 兜住所有尺寸变化 */
+    if (window.ResizeObserver) new ResizeObserver(function () { drawView(); }).observe(el.viewwrap);
   }
 
   /* ================= 启动 ================= */

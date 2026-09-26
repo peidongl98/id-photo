@@ -14,7 +14,7 @@
   --r-sm: 8px;
   --shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 6px 20px rgba(0, 0, 0, .05);
   --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
-  --sheet-h: 52svh;
+  --sheet-h: 46svh;
 }
 
 * { box-sizing: border-box; }
@@ -70,7 +70,7 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
   height: min(74vh, 660px); touch-action: none; cursor: grab;
 }
 .viewwrap.dragging { cursor: grabbing; }
-.viewwrap canvas { display: block; width: 100%; height: 100%; }
+.viewwrap canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
 .viewhint {
   position: absolute; left: 12px; bottom: 12px;
   padding: 5px 10px; border-radius: 980px;
@@ -260,16 +260,17 @@ input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 
   /* 工作台铺满视口：上方预览自适应，下方抽屉 */
   .studio {
     position: fixed; inset: 0; z-index: 30;
-    display: grid; grid-template-columns: 1fr;
-    grid-template-rows: minmax(0, 1fr) auto;
+    display: flex; flex-direction: column;
     gap: 0; background: var(--bg); padding: 0;
   }
-  .stagewrap { padding: 8px 12px 6px; gap: 8px; min-height: 0; }
-  .viewwrap { flex: 1 1 auto; min-height: 0; height: auto; border-radius: 14px; }
+  .stagewrap { flex: 1 1 auto; min-height: 0; padding: 8px 12px 6px; gap: 8px; overflow: hidden; }
+  .viewwrap { flex: 1 1 auto; min-height: 112px; height: auto; border-radius: 14px; }
   .viewhint { font-size: 11.5px; }
-  .viewbar { gap: 8px; }
+  .viewbar { gap: 8px; flex-wrap: nowrap; }
+  .viewbar .meta { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   .side {
+    flex: 0 0 auto; width: 100%; min-width: 0; overflow: hidden;
     background: var(--card);
     border-radius: 20px 20px 0 0;
     box-shadow: 0 -6px 26px rgba(0, 0, 0, .12);
@@ -278,11 +279,13 @@ input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 
     transition: max-height .26s ease;
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
-  .studio.sheet-full { --sheet-h: 86svh; }
-  .studio.sheet-peek { --sheet-h: 18svh; }
+  .studio.sheet-full { --sheet-h: 74svh; }
+  .studio.sheet-peek { --sheet-h: 16svh; }
   .grip { display: block; padding: 8px 0 4px; touch-action: none; cursor: grab; }
   .grip-bar { display: block; width: 40px; height: 5px; margin: 0 auto; border-radius: 3px; background: #D5D5DA; }
-  .side-scroll { overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 12px 14px; }
+  .side-scroll { overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; padding: 4px 12px 14px; min-width: 0; }
+  .side-scroll .card { min-width: 0; }
+  .more-toggle { max-width: 100%; }
   .sum-pill { display: flex; margin-bottom: 12px; }
   .card { padding: 16px; border-radius: 14px; }
   .spec { width: 118px; }
