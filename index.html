@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#FAFAFA">
+<title>证件照生成器 · 本地处理不上传</title>
+<meta name="description" content="免费在线证件照制作：拖动调整构图、MODNet 高精度抠图换底色、智能磨皮、合规检测。照片全部在浏览器本地处理，不上传服务器。">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- 运行阶段提示（含进度条） -->
+<div class="stage" id="stage" hidden>
+  <span class="spinner" aria-hidden="true"></span>
+  <span id="stageText">正在加载…</span>
+  <span class="stage-bar" id="stageBar" hidden><i id="stageBarFill"></i></span>
+</div>
+
+<header class="hero" id="hero">
+  <h1>证件照生成器</h1>
+  <p class="hero-sub">拖动构图 · 一键换底 · 智能磨皮 · 合规检测</p>
+  <p class="hero-tip">上传照片 → 选规格 → 下载</p>
+  <p class="hero-privacy">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+    照片不会上传，全部在本地处理
+  </p>
+</header>
+
+<main class="page">
+
+  <!-- 上传 -->
+  <section class="card card-upload" id="uploadCard">
+    <div class="drop" id="drop">
+      <svg class="drop-icon" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v13"/>
+      </svg>
+      <p class="drop-title">点击选择照片，或拖拽到这里</p>
+      <p class="drop-sub">支持 JPG / PNG / HEIC，手机可直接拍照</p>
+      <div class="drop-actions">
+        <button type="button" class="btn btn-primary" id="pickBtn">选择照片</button>
+        <button type="button" class="btn btn-ghost" id="shootBtn">拍照</button>
+      </div>
+      <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,image/*" hidden>
+      <input type="file" id="camInput" accept="image/*" capture="user" hidden>
+    </div>
+    <p class="notice" id="uploadNotice" hidden></p>
+  </section>
+
+  <!-- 工作台 -->
+  <div class="studio" id="studio" hidden>
+
+    <!-- 预览区 -->
+    <section class="stagewrap" id="stagewrap">
+      <div class="viewwrap" id="viewwrap">
+        <canvas id="viewCanvas"></canvas>
+        <div class="viewhint" id="viewHint">拖动移动取景框 · 滚轮 / 双指缩放</div>
+        <div class="chip-busy" id="busyChip" hidden><span class="spinner dark"></span><span id="busyText">处理中…</span></div>
+      </div>
+      <div class="viewbar">
+        <div class="seg" id="viewMode">
+          <button type="button" class="seg-btn is-on" data-mode="adjust">构图</button>
+          <button type="button" class="seg-btn" data-mode="result">看效果</button>
+        </div>
+        <span class="meta" id="cropMeta"></span>
+        <button type="button" class="btn btn-ghost btn-sm" id="resetFit">重置取景</button>
+      </div>
+      <div class="progress" id="progress" hidden><i id="progressFill"></i><span id="progressText"></span></div>
+    </section>
+
+    <!-- 参数区（桌面端常驻 / 手机端抽屉） -->
+    <aside class="side" id="side">
+      <div class="grip" id="grip" role="button" aria-label="展开或收起参数抽屉">
+        <span class="grip-bar"></span>
+      </div>
+
+      <div class="side-scroll" id="sideScroll">
+        <div class="sum-pill" id="sumPill"></div>
+
+        <section class="card">
+          <h2 class="card-title">规格</h2>
+          <div class="tabs" id="specTabs"></div>
+          <div class="spec-row" id="specRow"></div>
+          <p class="hint" id="specHint"></p>
+          <div class="custom-spec" id="customSpec" hidden>
+            <div class="seg" id="customUnit">
+              <button type="button" class="seg-btn is-on" data-unit="mm">毫米</button>
+              <button type="button" class="seg-btn" data-unit="px">像素</button>
+            </div>
+            <div class="custom-fields">
+              <label>宽<input type="number" id="cw" value="25" min="1" step="1"></label>
+              <label>高<input type="number" id="ch" value="35" min="1" step="1"></label>
+              <button type="button" class="btn btn-ghost btn-sm" id="applyCustom">应用</button>
+            </div>
+            <p class="hint">毫米按 300 DPI 换算（1mm ≈ 11.81px）；构图用默认参数</p>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">背景</h2>
+          <div class="swatches" id="swatches"></div>
+          <label class="inline-field">自定义底色
+            <input type="color" id="bgCustom" value="#FFFFFF">
+          </label>
+          <div class="matte-row">
+            <button type="button" class="btn btn-ghost btn-sm" id="hdMatteBtn">高精度抠图（MODNet）</button>
+            <span class="matte-tag" id="matteTag">标准</span>
+          </div>
+          <p class="hint" id="matteHint">MODNet 约 6.6MB，首次点击才下载，之后浏览器自动缓存。</p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">磨皮</h2>
+          <div class="slider-row">
+            <label for="intenSlider">强度</label>
+            <input type="range" id="intenSlider" min="0" max="30" step="1" value="22">
+            <output id="intenOut">22%</output>
+          </div>
+          <div class="slider-row">
+            <label for="radiusSlider">平滑半径</label>
+            <input type="range" id="radiusSlider" min="1" max="5" step="1" value="3">
+            <output id="radiusOut">3px</output>
+          </div>
+          <div class="row-inline">
+            <button type="button" class="btn btn-ghost btn-sm" id="peekBtn">按住对比原图</button>
+            <span class="hint inline" id="mopiHint">只作用于人脸区域，上限 30%</span>
+          </div>
+        </section>
+
+        <button type="button" class="btn btn-ghost more-toggle" id="moreToggle" aria-expanded="false">更多设置 <span class="caret">▾</span></button>
+
+        <div class="more-body" id="moreBody" hidden>
+          <section class="card">
+            <h2 class="card-title">目标文件大小</h2>
+            <div class="chips" id="sizeChips"></div>
+            <p class="hint" id="sizeHint">按目标大小自动调节 JPEG 质量（0.92 → 0.65）</p>
+          </section>
+
+          <section class="card">
+            <h2 class="card-title">手动微调</h2>
+            <div class="slider-row">
+              <label for="ratioSlider">取景大小</label>
+              <input type="range" id="ratioSlider" min="50" max="130" step="1" value="100">
+              <output id="ratioOut">100%</output>
+            </div>
+            <div class="slider-row">
+              <label for="posSlider">脸部垂直位置</label>
+              <input type="range" id="posSlider" min="30" max="60" step="1" value="42">
+              <output id="posOut">0.42</output>
+            </div>
+            <div class="nudge">
+              <span class="nudge-label">微移</span>
+              <div class="nudge-grid">
+                <button type="button" class="btn btn-ghost btn-icon" data-nudge="0,-0.01" aria-label="上移">↑</button>
+                <button type="button" class="btn btn-ghost btn-icon" data-nudge="-0.01,0" aria-label="左移">←</button>
+                <button type="button" class="btn btn-ghost btn-icon" data-nudge="0.01,0" aria-label="右移">→</button>
+                <button type="button" class="btn btn-ghost btn-icon" data-nudge="0,0.01" aria-label="下移">↓</button>
+              </div>
+              <button type="button" class="btn btn-ghost btn-sm" id="nudgeReset">复位</button>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2 class="card-title">合规详情</h2>
+            <ul class="checks" id="checks"></ul>
+            <p class="notice" id="checkNotice" hidden></p>
+          </section>
+        </div>
+
+        <section class="card actions-card">
+          <button type="button" class="btn btn-primary btn-lg" id="downloadBtn">下载证件照</button>
+          <button type="button" class="btn btn-ghost" id="resetBtn">重新上传</button>
+          <p class="notice" id="exportNotice" hidden></p>
+        </section>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<footer class="foot" id="foot">
+  <p>全部计算在浏览器完成，不经过任何服务器。</p>
+</footer>
+
+<script src="data/specs.js"></script>
+<script src="js/faceDetect.js"></script>
+<script src="js/bgRemove.js"></script>
+<script src="js/mopi.js"></script>
+<script src="js/crop.js"></script>
+<script src="js/compliance.js"></script>
+<script src="js/export.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>

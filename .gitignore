@@ -1,0 +1,16 @@
+# 依赖与系统
+node_modules/
+package-lock.json
+
+# 测试素材（仅本地验证用，不入库、不部署）
+assets/test/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+.wrangler/
+.workbuddy/
