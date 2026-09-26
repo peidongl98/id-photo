@@ -2,7 +2,7 @@
 
 纯前端证件照制作工具。上传照片 → 选规格 → 下载，全过程在浏览器本地完成，**照片不上传任何服务器**。
 
-- 线上地址：https://id-photo.pages.dev
+- 线上地址：https://id-photo-3kh.pages.dev
 - 仓库：https://github.com/peidongl98/id-photo
 
 ## 功能
