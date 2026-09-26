@@ -276,6 +276,7 @@ input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 
     max-height: var(--sheet-h);
     display: grid; grid-template-rows: auto minmax(0, 1fr);
     transition: max-height .26s ease;
+    padding-bottom: env(safe-area-inset-bottom, 0);
   }
   .studio.sheet-full { --sheet-h: 86svh; }
   .studio.sheet-peek { --sheet-h: 18svh; }
@@ -287,6 +288,12 @@ input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 
   .spec { width: 118px; }
   .slider-row label, .nudge-label { flex-basis: 76px; font-size: 13px; }
 
+  /* 触控目标一律 ≥44px */
+  .btn-sm, .btn-icon, .tab, .chip, .seg-btn { min-height: 44px; }
+  .btn-icon { width: 60px; }
+  .sw { width: 64px; }
+  .sw-chip { width: 46px; height: 46px; }
+  .custom-fields input, .inline-field input[type=color] { min-height: 44px; }
 
   .foot { padding-bottom: 20px; }
   #uploadCard { margin: 12px; }
