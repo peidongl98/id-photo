@@ -192,9 +192,17 @@
   }
 
   /* 人脸 + 整图 matte + 头顶（含发）→ 裁剪框 */
+  /* 分析期间：还没有裁剪框，取景工具与「对比原图」都无意义，先收起 */
+  function setAnalyzingUI(on) {
+    el.resetFit.hidden = on;
+    el.peekBtn.hidden = true;          /* 只有结果视图才显示 */
+    el.viewHint.textContent = on ? '正在分析，暂不可拖动取景' : '';
+  }
+
   function analyzePhoto() {
     state.analyzing = true;
     setLocked(true);
+    setAnalyzingUI(true);
     el.mainAction.textContent = '分析中…';
     busy(true, '正在分析人脸和轮廓…');
     return Promise.resolve()
@@ -221,7 +229,14 @@
       .then(function (ok) {
         state.analyzing = false;
         busy(false);
-        if (!ok) { setLocked(true); el.mainAction.textContent = '预生成'; return; }
+        if (!ok) {
+          /* 没检测到正脸：没有裁剪框，取景工具保持隐藏 */
+          setLocked(true);
+          el.resetFit.hidden = true;
+          el.viewHint.textContent = '';
+          el.mainAction.textContent = '预生成';
+          return;
+        }
         setLocked(false);
         gotoView('crop');
         updateMeta();
