@@ -2,7 +2,7 @@
    改模型或改前端资源时同步改 VERSION，激活时会自动清掉旧版本缓存。 */
 'use strict';
 
-const VERSION = 'v3';
+const VERSION = 'v4';
 const CORE = 'idphoto-core-' + VERSION;
 const MODELS = 'idphoto-models-' + VERSION;
 const RUNTIME = 'idphoto-runtime-' + VERSION;

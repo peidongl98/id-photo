@@ -1,15 +1,19 @@
-/* 主流程：上传 → 人脸检测 → 构图（可拖动）→ 抠图 → 磨皮 → 合成 → 合规 → 导出
-   两层处理：实时预览层（最长边 600）+ 输出层（原分辨率，只在下载时跑） */
+/* 主流程
+   上传 → EXIF 方向 → 人脸检测 → MODNet 整图 matte（一次）→ 头顶含发定位 → 裁剪框
+   → 「预生成」按当前裁剪框裁剪 + 磨皮 + 合成（复用中间结果）→ 结果视图
+   裁剪视图拖动/缩放只移动取景框，不做任何图像处理。 */
 (function () {
   'use strict';
 
-  var $ = function (s) { return document.querySelector(s); };
   var SPECS = window.IDP.SPECS;
   var CATS = window.IDP.CATEGORIES;
   var D = window.IDP.SPEC_DEFAULTS;
 
-  var PREVIEW_LONG = 600;      /* 实时预览层尺寸 */
-  var DEBOUNCE_MS = 300;       /* 松手后重算延迟 */
+  var RESULT_LONG_CAP = 1200;  /* 屏幕预览层的长边上限（够屏幕清晰，又不至于太贵） */
+  var ANALYZE_SHORT = 640;     /* 整图 matte 的分析分辨率（MODNet 内部也只会用到 512 短边） */
+  var ANALYZE_LONG_CAP = 1280;
+  var JOB_TIMEOUT = 15000;     /* 处理超时 */
+  var RERENDER_DEBOUNCE = 300; /* 结果视图调参重算的 debounce */
   var MAX_KB_CANVAS = 16000000;
   var HEIC_CDNS = [
     'https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js',
@@ -22,31 +26,36 @@
     bg: SPECS[0].bg_color,
     intensity: 0.22, radius: 3,
     target: 'none', customUnit: 'mm',
-    /* 构图 */
     zoom: 1, offsetX: 0, offsetY: 0, centerY: null,
-    rect: null, dragging: false, viewMode: 'adjust',
-    /* 结果 */
+    rect: null, dragging: false,
+    view: 'crop',                 /* crop | result */
     engine: 'modnet',
-    hasPhoto: false,
-    matte: null, matteKey: '',
-    previewBase: null, previewCanvas: null, previewMask: null,
+    hasPhoto: false, analyzing: false, booted: false,
+    matte: null, matteW: 0, matteH: 0,      /* 整图 alpha，分析阶段算一次 */
+    result: null,                            /* { base, alpha, mask, composed, canvas, metrics } */
     fullCanvas: null,
     metrics: null, results: [], overall: 'pass',
-    exportInfo: null, gen: 0
+    exportInfo: null, gen: 0, renderSeq: 0
   };
 
   var el = {};
   ['boot','bootStage','bootRows','bootErr','bootEnter','bootRetry',
    'app','display','uploadBox','pickBtn','shootBtn','fileInput','camInput','uploadNotice',
-   'viewwrap','viewCanvas','viewHint','cropMeta','busyChip','busyText','viewMode','resetFit','peekBtn',
+   'viewwrap','viewCanvas','viewHint','cropMeta','busyChip','busyText','resetFit','peekBtn',
    'sumBar','sumIcon','sumText',
-   'controls','specTabs','specScroll','specFade','specRow','specHint','customSpec','customUnit','cw','ch','applyCustom',
+   'controls','mainRow','mainAction','cancelBtn',
+   'specTabs','specScroll','specFade','specRow','specHint','specText','specPicker',
+   'customSpec','customUnit','cw','ch','applyCustom',
    'swatches','bgCustom','matteHint','intenSlider','intenOut','radiusSlider','radiusOut','mopiHint',
-   'sizeChips','sizeHint','applyBgBtn','downloadBtn','resetBtn','exportNotice','progress','progressFill','progressText',
-   'modal','modalClose','modalDownload','checks','checkNotice'
+   'sizeChips','sizeHint','preHint','applyBgBtn','downloadBtn','resetBtn','exportNotice',
+   'progress','progressFill','progressText',
+   'modal','modalClose','modalDownload','checks','checkNotice',
+   'zoomView','zoomCanvas'
   ].forEach(function (id) { el[id] = document.getElementById(id); });
 
-  /* ================= 轻提示（顶部横条已移除，不再遮挡预览） ================= */
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  /* ================= 轻提示 ================= */
   var toastEl = null, toastTimer = 0;
   function toast(text, ms) {
     if (toastEl) toastEl.parentNode.removeChild(toastEl);
@@ -60,27 +69,20 @@
       toastEl = null;
     }, ms || 2000);
   }
-
-  /* 处理阶段：有照片时走预览区内的「处理中…」角标，无照片时用轻提示 */
-  function setStage(text) {
-    if (state.hasPhoto) busy(!!text, text || undefined);
-    else if (text) toast(text, 2000);
-  }
-  function setStageProgress() { /* 启动页与导出进度条各自负责，这里不再需要 */ }
   function notice(node, text, kind) {
+    if (!node) return;
     if (!text) { node.hidden = true; node.textContent = ''; return; }
     node.hidden = false; node.textContent = text;
     node.className = 'notice' + (kind ? ' is-' + kind : '');
   }
-  function fail(err) {
-    var msg = (err && err.message) || String(err);
-    setStage(''); setStageProgress(null);
-    notice(el.uploadNotice, msg, 'err');
-    if (el.exportNotice) notice(el.exportNotice, msg, 'err');
-  }
   function busy(on, text) {
     el.busyChip.hidden = !on;
     if (text) el.busyText.textContent = text;
+  }
+  function fail(err) {
+    var msg = (err && err.message) || String(err);
+    busy(false); notice(el.uploadNotice, msg, 'err');
+    if (el.exportNotice) notice(el.exportNotice, msg, 'err');
   }
 
   /* ================= 图片读取 ================= */
@@ -123,7 +125,7 @@
     if (!/^image\//i.test(file.type) && !isHeic(file)) return Promise.reject(new Error('只支持 JPG / PNG / HEIC 图片'));
     if (file.size > 40 * 1024 * 1024) return Promise.reject(new Error('图片太大（超过 40MB），请先压缩'));
     if (isHeic(file)) {
-      setStage('正在转换 HEIC 照片…', true);
+      busy(true, '正在转换 HEIC 照片…');
       return heicToJpeg(file).then(function (b) {
         return loadImageEl(b).catch(function () { throw new Error('HEIC 转换失败，请改用 JPG / PNG'); });
       });
@@ -131,7 +133,27 @@
     return loadImageEl(file).catch(function () { return heicToJpeg(file).then(loadImageEl); });
   }
 
-  /* ================= 规格 ================= */
+  /* ================= 任务（可取消 + 超时） ================= */
+  function newJob() {
+    var j = { cancelled: false, timedOut: false, timer: 0 };
+    j.timer = setTimeout(function () { j.timedOut = true; j.cancelled = true; }, JOB_TIMEOUT);
+    return j;
+  }
+  function endJob(j) { if (j) clearTimeout(j.timer); }
+  /* 分帧执行：每步让出主线程，取消按钮才点得动，也能及时更新提示 */
+  function step(job, fn) {
+    return new Promise(function (res, rej) {
+      setTimeout(function () {
+        if (job && job.cancelled) return res(false);
+        try { fn(); res(true); } catch (e) { rej(e); }
+      }, 0);
+    });
+  }
+  function cancelRunning() {
+    if (state.job) { state.job.cancelled = true; state.job.timedOut = false; }
+  }
+
+  /* ================= 规格 / 构图 ================= */
   function specFor() {
     var s = {};
     for (var k in state.spec) s[k] = state.spec[k];
@@ -141,141 +163,294 @@
     return s;
   }
   function computeRect() {
+    if (!state.face || !state.master) return null;
     return window.IDP.Crop.computeCrop(state.face, state.master, specFor(), {
       zoom: state.zoom, offsetX: state.offsetX, offsetY: state.offsetY
     });
   }
+  function refreshRect() {
+    if (!state.face) return;
+    state.rect = computeRect();
+    invalidateResult();
+    updateMeta();
+    drawView();
+  }
+  function invalidateResult() { state.result = null; state.fullCanvas = null; }
+  function invalidateFull() { state.fullCanvas = null; }
 
-  /* ================= 预览层 ================= */
-  var previewTimer = 0, previewBusy = false, previewQueued = false, lastUpAt = 0;
-
-  function schedulePreview(delay) {
-    clearTimeout(previewTimer);
-    previewTimer = setTimeout(function () { runPreview(); }, delay == null ? DEBOUNCE_MS : delay);
+  /* ================= 分析阶段（每个照片只跑一次） ================= */
+  function analyzeCanvas(master) {
+    var w = master.width, h = master.height;
+    var s = Math.min(1, ANALYZE_SHORT / Math.min(w, h), ANALYZE_LONG_CAP / Math.max(w, h));
+    var c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(w * s));
+    c.height = Math.max(1, Math.round(h * s));
+    var ctx = c.getContext('2d');
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(master, 0, 0, c.width, c.height);
+    return c;
   }
 
-  function matteKey(rect, spec) {
-    return [spec.width_px, spec.height_px, state.engine,
-            Math.round(rect.x), Math.round(rect.y), Math.round(rect.w), Math.round(rect.h)].join(':');
+  /* 人脸 + 整图 matte + 头顶（含发）→ 裁剪框 */
+  function analyzePhoto() {
+    state.analyzing = true;
+    setLocked(true);
+    el.mainAction.textContent = '分析中…';
+    busy(true, '正在分析人脸和轮廓…');
+    return Promise.resolve()
+      .then(function () { return window.IDP.FaceDetect.analyze(state.master); })
+      .then(function (face) {
+        if (face === null) {
+          notice(el.uploadNotice, '没有检测到清晰的正脸。请换一张正面免冠、光线均匀、人脸清晰的照片。', 'err');
+          return null;
+        }
+        if (!face) return null;
+        state.face = face;
+        busy(true, '正在分析人像轮廓…');
+        var ac = analyzeCanvas(state.master);
+        return window.IDP.BgRemove.segment(ac, { engine: state.engine }).then(function (r) {
+          state.engine = r.engine;
+          state.matte = r.alpha; state.matteW = ac.width; state.matteH = ac.height;
+          if (r.engine !== 'modnet') updateMatteTag(r.modnetError); else updateMatteTag();
+          busy(true, '正在定位头顶与发际…');
+          state.face = window.IDP.Crop.withHairHead(state.face, state.matte, state.matteW, state.matteH);
+          state.rect = computeRect();
+          return true;
+        });
+      })
+      .then(function (ok) {
+        state.analyzing = false;
+        busy(false);
+        if (!ok) { setLocked(true); el.mainAction.textContent = '预生成'; return; }
+        setLocked(false);
+        gotoView('crop');
+        updateMeta();
+        drawView();
+      })
+      .catch(function (e) { state.analyzing = false; busy(false); fail(e); });
   }
 
-  function ensureMatte(base, key, onStage) {
-    if (state.matte && state.matteKey === key) return Promise.resolve(state.matte);
-    if (onStage) onStage('正在分离人像…');
-    var needLoad = state.engine === 'modnet' && !window.IDP.BgRemove.isModnetReady();
-    if (needLoad) { setStage('正在加载 MODNet 模型…', true); setStageProgress(0); }
-    return window.IDP.BgRemove.segment(base, {
-      engine: state.engine,
-      onStage: function (t) { if (needLoad) setStage(t, true); },
-      onProgress: function (p) { if (needLoad) setStageProgress(0.05 + p * 0.9); }
-    }).then(function (r) {
-      if (needLoad) { setStage('MODNet 就绪', false); setStageProgress(null); }
-      state.matte = r.alpha;
-      state.matteKey = key;
-      if (r.engine !== state.engine) {
-        state.engine = r.engine;
-        updateMatteTag(r.modnetError);
-      } else if (r.engine === 'modnet' && state.engine === 'modnet') {
-        updateMatteTag();
-      }
-      return state.matte;
+  /* ================= 生成结果（复用分析阶段的 matte，不重跑模型） ================= */
+  function viewDeviceLong() {
+    var w = el.viewwrap.clientWidth, h = el.viewwrap.clientHeight;
+    if (!w || !h) {
+      w = Math.max(240, Math.min(window.innerWidth, 620) - 24);
+      h = clamp(window.innerHeight * 0.52, 190, 540);
+    }
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    return Math.max(w, h) * dpr;
+  }
+  /* 结果层长边：不小于规格像素（保证「所见即所得」的下限），也不小于屏幕实际需要，
+     且不超过裁剪源本身的像素（避免无意义的放大）。规格本身超过上限时不缩——预览不能比
+     交付文件还差。 */
+  function resultLong() {
+    var specLong = Math.max(state.spec.width_px, state.spec.height_px);
+    var need = Math.max(specLong, Math.round(viewDeviceLong()));
+    if (specLong <= RESULT_LONG_CAP) need = Math.min(need, RESULT_LONG_CAP);
+    if (state.rect) {
+      var srcLong = Math.max(state.rect.w, state.rect.h);
+      need = Math.min(need, Math.max(specLong, Math.round(srcLong)));
+    }
+    return need;
+  }
+  function alphaFor(rect, base) {
+    var sA = state.matteW / state.master.width;
+    return window.IDP.BgRemove.sampleMatte(
+      state.matte, state.matteW, state.matteH,
+      { x: rect.x * sA, y: rect.y * sA, w: rect.w * sA, h: rect.h * sA },
+      base.width, base.height);
+  }
+  /* long=null 表示按规格原始像素 */
+  function computeResult(long, onStage, job) {
+    var spec = specFor();
+    var rect = state.rect;
+    var r = { spec: spec, rect: rect, long: long, timings: {} };
+    var tA = performance.now();
+    return step(job, function () {
+      onStage('正在裁剪…');
+      r.base = window.IDP.Crop.renderCrop(state.master, rect, spec, long);
+      r.timings.crop = performance.now() - tA; tA = performance.now();
+    })
+      .then(function (ok) {
+        if (!ok) return false;
+        return step(job, function () {
+          onStage('正在处理发丝边缘…');
+          r.alpha = alphaFor(rect, r.base);
+          r.timings.alpha = performance.now() - tA; tA = performance.now();
+        });
+      })
+      .then(function (ok) {
+        if (!ok) return false;
+        return step(job, function () {
+          onStage('正在合成背景…');
+          r.composed = window.IDP.BgRemove.composite(r.base, r.alpha, state.bg);
+          r.bgUsed = state.bg;
+          r.timings.composite = performance.now() - tA; tA = performance.now();
+          r.mask = window.IDP.Crop.makeFaceMask(state.face, state.master, rect, spec, r.base.width, r.base.height);
+        });
+      })
+      .then(function (ok) {
+        if (!ok) return false;
+        return step(job, function () {
+          onStage('正在磨皮…');
+          r.canvas = window.IDP.Mopi.apply(r.composed, {
+            intensity: state.intensity, radius: state.radius, mask: r.mask
+          });
+          r.metrics = window.IDP.Crop.faceMetrics(state.face, state.master, rect, spec, r.base.width, r.base.height);
+          r.timings.mopi = performance.now() - tA;
+        });
+      })
+      .then(function (ok) { return ok ? r : null; });
+  }
+
+  /* 预览层（屏幕清晰）+ 交付层（规格原始像素）。两层共用同一份 alpha，都不重跑模型。 */
+  function renderBoth(onStage, job) {
+    var plong = resultLong();
+    return computeResult(plong, onStage, job).then(function (r) {
+      if (!r) return null;
+      r.full = null;
+      if (r.canvas.width === state.spec.width_px && r.canvas.height === state.spec.height_px) return r;
+      return computeResult(null, onStage, job).then(function (f) {
+        if (f) r.full = f;
+        return r;
+      });
     });
   }
-
-  function runPreview() {
-    if (!state.master || !state.face) return Promise.resolve();
-    if (previewBusy) { previewQueued = true; return Promise.resolve(); }
-    if (lastUpAt) { state.lastDebounce = performance.now() - lastUpAt; lastUpAt = 0; }
-    previewBusy = true;
-    var spec = specFor();
-    var rect = computeRect();
-    state.rect = rect;
-    state.metrics = window.IDP.Crop.faceMetrics(state.face, state.master, rect, spec);
-    busy(true, '处理中…');
-    var T = {}, tA = performance.now();
-    return Promise.resolve()
-      .then(function () {
-        var base = window.IDP.Crop.renderCrop(state.master, rect, spec, PREVIEW_LONG);
-        T.crop = performance.now() - tA; tA = performance.now();
-        var key = matteKey(rect, spec);
-        return ensureMatte(base, key).then(function () {
-          T.segment = performance.now() - tA; tA = performance.now();
-          state.previewBase = window.IDP.BgRemove.composite(base, state.matte, state.bg);
-          T.composite = performance.now() - tA; tA = performance.now();
-          state.previewMask = window.IDP.Crop.makeFaceMask(state.face, state.master, rect, spec, base.width, base.height);
-          state.previewCanvas = window.IDP.Mopi.apply(state.previewBase, {
-            intensity: state.intensity, radius: state.radius, mask: state.previewMask
-          });
-          T.mopi = performance.now() - tA; tA = performance.now();
-          runCompliance(state.previewCanvas, state.metrics);
-          T.total = T.crop + T.segment + T.composite + T.mopi;
-          state.timings = T;
-          drawView();
-          updateMeta();
-          state.gen++;
-        });
-      })
-      .catch(fail)
-      .then(function () {
-        busy(false);
-        previewBusy = false;
-        if (previewQueued) { previewQueued = false; return runPreview(); }
-        if (!state.fullCanvas) refreshExportInfo();
-      });
+  function resultCanvas() {
+    var r = state.result;
+    if (!r) return null;
+    return (r.full && r.full.canvas) || r.canvas;
   }
 
-  /* ================= 全分辨率输出层 ================= */
-  function runFull(onStage, onProgress) {
-    var spec = specFor();
-    var rect = state.rect || computeRect();
-    var fullMatte = null;
-    state.rect = rect;
-    return Promise.resolve()
-      .then(function () {
-        onStage('正在按原分辨率裁剪…'); onProgress(0.06);
-        var base = window.IDP.Crop.renderCrop(state.master, rect, spec, null);
-        return { base: base, spec: spec, rect: rect };
-      })
+  function beginJob(text) {
+    var job = newJob();
+    state.job = job;
+    setLocked(true);
+    el.mainAction.textContent = text;
+    el.mainAction.disabled = true;
+    el.cancelBtn.hidden = false;
+    busy(true, text);
+    return job;
+  }
+  function finishJob(job) {
+    endJob(job);
+    if (state.job === job) state.job = null;
+    el.cancelBtn.hidden = true;
+    el.mainAction.disabled = false;
+    busy(false);
+    setLocked(false);
+    applyViewUI();
+  }
+
+  function preGenerate() {
+    if (state.view === 'result') { backToCrop(); return; }
+    if (!state.hasPhoto || !state.face || state.analyzing || state.job) return;
+    if (!state.rect) state.rect = computeRect();
+    if (!state.rect) return;
+    notice(el.uploadNotice, '');
+    var job = beginJob('处理中…');
+    var key = resultKey();
+    if (state.result && state.result.key === key) {  /* 裁剪框没动 → 直接复用 */
+      finishJob(job);
+      gotoView('result');
+      return;
+    }
+    var stage = function (t) { if (state.job === job) { el.mainAction.textContent = t; busy(true, t); } };
+    renderBoth(stage, job)
       .then(function (r) {
-        if (state.engine === 'modnet' && !window.IDP.BgRemove.isModnetReady()) {
-          onStage('正在加载 MODNet 模型…');
-          return window.IDP.BgRemove.ensureModnet(onStage, function (p) {
-            onProgress(0.08 + p * 0.32);
-          }).then(function () { return r; });
+        var timedOut = job.timedOut;
+        finishJob(job);
+        if (!r) {
+          if (timedOut) { fail(new Error('处理超时，请重试')); }
+          gotoView('crop');
+          return;
         }
-        return r;
+        r.key = key;
+        state.result = r;
+        state.fullCanvas = null;
+        state.metrics = r.metrics;
+        runCompliance(r.canvas, r.metrics, r.alpha);
+        gotoView('result');
+        refreshExportInfo();
+        drawView();
+        state.renderSeq++;
       })
-      .then(function (r) {
-        onStage('正在分离人像…'); onProgress(0.44);
-        return window.IDP.BgRemove.segment(r.base, { engine: state.engine }).then(function (m) {
-          state.engine = m.engine;
-          fullMatte = m.alpha;
-          return r;
+      .catch(function (e) { finishJob(job); fail(e); gotoView('crop'); });
+  }
+
+  function resultKey() {
+    var r = state.rect;
+    if (!r) return '';
+    return [state.spec.id, state.bg, state.intensity, state.radius,
+            Math.round(r.x), Math.round(r.y), Math.round(r.w), Math.round(r.h)].join('|');
+  }
+
+  /* 结果视图里调背景 / 磨皮 → 复用 base / alpha / mask 快速重算 */
+  var rerenderTimer = 0;
+  function scheduleReRender() {
+    if (state.view !== 'result' || !state.result) return;
+    invalidateFull();
+    clearTimeout(rerenderTimer);
+    rerenderTimer = setTimeout(doReRender, RERENDER_DEBOUNCE);
+  }
+  function doReRender() {
+    var r = state.result;
+    if (state.view !== 'result' || !r || state.job) return;
+    var job = newJob();
+    state.job = job;
+    busy(true, '正在应用参数…');
+    el.cancelBtn.hidden = false;
+    step(job, function () {
+      /* 只动了磨皮 / 半径时不必重新合成背景 */
+      if (r.composed && r.bgUsed === state.bg) return;
+      r.composed = window.IDP.BgRemove.composite(r.base, r.alpha, state.bg);
+      r.bgUsed = state.bg;
+    })
+      .then(function (ok) {
+        if (!ok) return false;
+        return step(job, function () {
+          r.canvas = window.IDP.Mopi.apply(r.composed, {
+            intensity: state.intensity, radius: state.radius, mask: r.mask
+          });
         });
       })
-      .then(function (r) {
-        onStage('正在合成背景与磨皮…'); onProgress(0.72);
-        var composed = window.IDP.BgRemove.composite(r.base, fullMatte, state.bg);
-        var mask = window.IDP.Crop.makeFaceMask(state.face, state.master, r.rect, r.spec, r.base.width, r.base.height);
-        var final = window.IDP.Mopi.apply(composed, { intensity: state.intensity, radius: state.radius, mask: mask });
-        onProgress(0.9);
-        state.metrics = window.IDP.Crop.faceMetrics(state.face, state.master, r.rect, r.spec, r.base.width, r.base.height);
-        return final;
+      .then(function (ok) {
+        /* 交付层同步重算（规格很小，代价可忽略；预览即规格时跳过） */
+        if (!ok || !r.full) return ok;
+        return step(job, function () {
+          var f = r.full;
+          if (f.composed && f.bgUsed === state.bg) return;
+          f.composed = window.IDP.BgRemove.composite(f.base, f.alpha, state.bg);
+          f.bgUsed = state.bg;
+        }).then(function (ok2) {
+          if (!ok2) return false;
+          return step(job, function () {
+            var f = r.full;
+            f.canvas = window.IDP.Mopi.apply(f.composed, {
+              intensity: state.intensity, radius: state.radius, mask: f.mask
+            });
+          });
+        });
       })
-      .then(function (final) {
-        state.fullCanvas = final;
-        onStage('正在做合规检测…');
-        runCompliance(final, state.metrics, fullMatte);
-        onProgress(1);
-        return final;
-      });
+      .then(function (ok) {
+        endJob(job); state.job = null;
+        el.cancelBtn.hidden = true; busy(false);
+        if (!ok || !r.canvas) return;
+        r.key = resultKey();
+        state.metrics = r.metrics;
+        runCompliance(r.canvas, r.metrics, r.alpha);
+        drawView();
+        refreshExportInfo();
+        state.renderSeq++;
+      })
+      .catch(function (e) { endJob(job); state.job = null; el.cancelBtn.hidden = true; busy(false); fail(e); });
   }
 
   /* ================= 视图绘制 ================= */
-  function drawView() {
+  function syncCanvas() {
     var wrap = el.viewwrap, vc = el.viewCanvas;
     var W = wrap.clientWidth, H = wrap.clientHeight;
-    if (!W || !H) return;
+    if (!W || !H) return null;
     var dpr = Math.min(window.devicePixelRatio || 1, 2);
     if (vc.width !== Math.round(W * dpr) || vc.height !== Math.round(H * dpr)) {
       vc.width = Math.round(W * dpr); vc.height = Math.round(H * dpr);
@@ -283,58 +458,53 @@
     var ctx = vc.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
+    return { ctx: ctx, W: W, H: H };
+  }
+
+  function drawView() {
     if (!state.master) return;
+    var s = syncCanvas();
+    if (!s) return;
+    if (state.view === 'result') drawResult(s.ctx, s.W, s.H);
+    else drawCropView(s.ctx, s.W, s.H);
+  }
 
-    if (state.viewMode === 'result') {
-      var c = state.previewCanvas;
-      if (!c) return;
-      var s0 = Math.min(W / c.width, H / c.height);
-      var dw0 = c.width * s0, dh0 = c.height * s0;
-      ctx.drawImage(c, (W - dw0) / 2, (H - dh0) / 2, dw0, dh0);
-      state._viewScale = s0; state._viewOrigin = [(W - dw0) / 2, (H - dh0) / 2, true];
-      return;
-    }
+  function drawResult(ctx, W, H) {
+    var c = state.result && state.result.canvas;
+    if (!c) return;
+    var k = Math.min(W / c.width, H / c.height);
+    var dw = c.width * k, dh = c.height * k;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect((W - dw) / 2, (H - dh) / 2, dw, dh);
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(c, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    state._viewScale = k;
+    state._viewOrigin = [(W - dw) / 2, (H - dh) / 2, true];
+  }
 
-    var m = state.master;
-    var r = state.rect;
-    /* 适配范围 = 原图 ∪ 裁剪框，保证取景框永远完整可见；
-       拖动时锁定缩放，避免画面跟着取景框一起缩放 */
+  function drawCropView(ctx, W, H) {
+    var m = state.master, r = state.rect;
     if (!state.dragging || !state._fit) {
       var bx0 = 0, by0 = 0, bx1 = m.width, by1 = m.height;
       if (r) {
         bx0 = Math.min(bx0, r.x); by0 = Math.min(by0, r.y);
         bx1 = Math.max(bx1, r.x + r.w); by1 = Math.max(by1, r.y + r.h);
       }
-      var pad = 0.03;
-      var bw = (bx1 - bx0) * (1 + pad * 2), bh = (by1 - by0) * (1 + pad * 2);
-      state._fit = { x0: bx0 - (bx1 - bx0) * pad, y0: by0 - (by1 - by0) * pad, w: bw, h: bh };
+      var pad = 0.03, bw = bx1 - bx0, bh = by1 - by0;
+      state._fit = { x0: bx0 - bw * pad, y0: by0 - bh * pad, w: bw * (1 + pad * 2), h: bh * (1 + pad * 2) };
     }
     var fit = state._fit;
-    var s = Math.min(W / fit.w, H / fit.h);
-    var ox = (W - fit.w * s) / 2 - fit.x0 * s;
-    var oy = (H - fit.h * s) / 2 - fit.y0 * s;
-    state._viewScale = s;
+    var k = Math.min(W / fit.w, H / fit.h);
+    var ox = (W - fit.w * k) / 2 - fit.x0 * k;
+    var oy = (H - fit.h * k) / 2 - fit.y0 * k;
+    state._viewScale = k;
 
-    ctx.drawImage(m, ox, oy, m.width * s, m.height * s);
-
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(m, ox, oy, m.width * k, m.height * k);
     if (!r) return;
-    var rx = ox + r.x * s, ry = oy + r.y * s, rw = r.w * s, rh = r.h * s;
-    state._frame = { x: rx, y: ry, w: rw, h: rh };
 
-      if (!state.dragging && state.previewCanvas) {
-        ctx.save();
-        ctx.beginPath(); ctx.rect(rx, ry, rw, rh); ctx.clip();
-        ctx.drawImage(state.previewCanvas, rx, ry, rw, rh);
-        ctx.restore();
-      } else {
-        /* 拖动中：框内直接用原图垫底，避免露出画布底色 */
-        ctx.save();
-        ctx.beginPath(); ctx.rect(rx, ry, rw, rh); ctx.clip();
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(rx, ry, rw, rh);
-        ctx.drawImage(m, ox, oy, m.width * s, m.height * s);
-        ctx.restore();
-      }
+    var rx = ox + r.x * k, ry = oy + r.y * k, rw = r.w * k, rh = r.h * k;
+    state._frame = { x: rx, y: ry, w: rw, h: rh };
 
     ctx.save();
     ctx.fillStyle = 'rgba(18,18,22,.44)';
@@ -357,154 +527,81 @@
 
   function updateMeta() {
     var r = state.rect, sp = specFor();
-    if (!r) return;
+    if (!r) { el.cropMeta.hidden = true; return; }
+    el.cropMeta.hidden = state.view === 'result';
     el.cropMeta.textContent = sp.width_px + '×' + sp.height_px + 'px' +
       ' · 头顶留白 ' + (r.topMargin * 100).toFixed(1) + '%' +
+      ' · 头部占比 ' + (r.faceRatio * 100).toFixed(0) + '%' +
       ' · 下巴 ' + (r.chinMargin * 100).toFixed(0) + '%';
   }
 
   function updateMatteTag(err) {
     var hd = state.engine === 'modnet';
     el.matteHint.textContent = hd
-      ? '已启用 MODNet 高精度抠图（模型已缓存，发丝过渡更自然）。'
-      : (err ? 'MODNet 加载失败，已自动降级为标准抠图：' + err
-             : 'MODNet 约 6.6MB，首次点击才下载，之后浏览器自动缓存。');
+      ? '已启用 MODNet 高精度抠图（发丝过渡更自然）。'
+      : (err ? 'MODNet 不可用，已降级为标准抠图：' + err : '抠图引擎：标准模式。');
   }
 
-  function invalidateMatte() { state.matte = null; state.matteKey = ''; state.fullCanvas = null; }
-  function invalidateFull() { state.fullCanvas = null; }
-
-  /* ================= 合规 ================= */
-  var ICONS = {
-    pass: '<svg class="ck-icon" viewBox="0 0 24 24" fill="none" stroke="#34C759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5L16 9.5"/></svg>',
-    warn: '<svg class="ck-icon" viewBox="0 0 24 24" fill="none" stroke="#FF9500" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.6l9 15.4H3z"/><path d="M12 9.5v4.2"/><circle cx="12" cy="16.6" r="0.9" fill="#FF9500" stroke="none"/></svg>',
-    fail: '<svg class="ck-icon" viewBox="0 0 24 24" fill="none" stroke="#FF3B30" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>'
-  };
-  var LV_TEXT = { pass: '检测通过，可正常下载', warn: '检测有提醒项，仍可下载', fail: '检测未通过，请先修正' };
-
-  function runCompliance(canvas, metrics, matte) {
-    if (!canvas) return;
-    state.results = window.IDP.Compliance.check(canvas, metrics, {
-      intensity: state.intensity,
-      bgRgb: window.IDP.BgRemove.hexToRgb(state.bg),
-      alpha: matte || state.matte
-    });
-    state.overall = window.IDP.Compliance.overall(state.results);
-
-    el.checks.innerHTML = state.results.map(function (r) {
-      return '<li class="lv-' + r.level + '">' + ICONS[r.level] +
-        '<div class="ck-body"><div class="ck-name">' + r.name + '</div>' +
-        '<div class="ck-text">' + r.text + '</div></div></li>';
-    }).join('');
-
-    /* 概要行：全通过 / N 项警告 / N 项不通过 */
-    var nWarn = 0, nFail = 0;
-    state.results.forEach(function (r) {
-      if (r.level === 'warn') nWarn++;
-      else if (r.level === 'fail') nFail++;
-    });
-    el.sumBar.className = 'sumbar lv-' + state.overall;
-    el.sumIcon.innerHTML = ICONS[state.overall];
-    el.sumText.textContent = nFail ? (nFail + ' 项不通过') : (nWarn ? (nWarn + ' 项警告') : '符合规范');
-    el.sumBar.hidden = !state.hasPhoto;
-
-    var can = state.overall !== 'fail';
-    el.downloadBtn.disabled = !can;
-    el.modalDownload.disabled = !can;
-    if (can) {
-      notice(el.checkNotice, state.overall === 'warn'
-        ? '有提醒项，仍可下载；如需通过官方验证建议先按提示调整。' : '', state.overall === 'warn' ? 'warn' : '');
-    } else {
-      el.checkNotice.hidden = false;
-      el.checkNotice.className = 'notice is-err';
-      el.checkNotice.innerHTML = '检测未通过，下载已停用，请先按提示修正。' +
-        ' <button type="button" class="btn btn-ghost btn-sm" id="forceDl" style="min-height:28px;padding:0 10px;font-size:13px;margin-left:6px">仍要下载</button>';
-      var f = document.getElementById('forceDl');
-      if (f) f.addEventListener('click', function () { closeModal(); doDownload(true); });
+  /* ================= 视图 / 锁定 ================= */
+  function applyViewUI() {
+    var res = state.view === 'result';
+    el.specPicker.hidden = res;
+    el.customSpec.hidden = res ? true : (state.cat !== '自定义');
+    el.specText.hidden = !res;
+    if (res) {
+      el.specText.textContent = '当前规格：' + state.spec.name +
+        '（' + state.spec.width_px + '×' + state.spec.height_px + 'px）';
     }
+    el.resetFit.hidden = res;
+    el.peekBtn.hidden = !res;
+    el.viewHint.textContent = res ? '点图片可放大查看' : '拖动移动取景框 · 滚轮 / 双指缩放';
+    el.preHint.hidden = res;
+    el.sumBar.hidden = !res || !state.hasPhoto;
+    el.downloadBtn.classList.toggle('is-muted', !res);
+    el.mainAction.textContent = res ? '重新裁剪' : '预生成';
+    updateMeta();
   }
 
-  /* ---------- 校验详情浮层 ---------- */
-  function openModal() { if (state.hasPhoto) el.modal.hidden = false; }
-  function closeModal() { el.modal.hidden = true; }
-
-  /* ================= 导出 ================= */
-  var exportTimer = 0;
-  function refreshExportInfo() {
-    clearTimeout(exportTimer);
-    exportTimer = setTimeout(function () {
-      var cv = state.fullCanvas || state.previewCanvas;
-      if (!cv) return;
-      window.IDP.Export.encode(cv, state.target).then(function (info) {
-        state.exportInfo = info;
-        var t = info.target;
-        var msg = (state.fullCanvas ? '' : '按预览估算：') + '当前导出约 ' + info.kb.toFixed(1) + ' KB（质量 ' + info.quality.toFixed(2) + '）';
-        if (t.max !== Infinity) msg += '，目标 ' + t.min + '–' + t.max + ' KB';
-        var kind = 'ok';
-        if (!info.ok && info.reason === 'over') { msg += ' —— 已压到最低质量仍超出，可直接下载但不满足目标'; kind = 'err'; }
-        if (!info.ok && info.reason === 'under') { msg += ' —— 低于目标下限，官方系统可能拒收小文件'; kind = 'warn'; }
-        notice(el.exportNotice, msg, kind);
-      }).catch(function () { });
-    }, 320);
+  function gotoView(v) {
+    state.view = v;
+    if (v === 'crop') { state._fit = null; }
+    applyViewUI();
+    drawView();
+  }
+  function backToCrop() {
+    closeZoom();
+    gotoView('crop');
+    el.controls.scrollTop = 0;
   }
 
-  function doDownload(force) {
-    if (state.overall === 'fail' && !force) return;
-    el.downloadBtn.disabled = true;
-    el.progress.hidden = false;
-    el.progressFill.style.width = '2%';
-    el.progressText.textContent = '准备中…';
-    setStage('正在生成原分辨率图片…', true);
-    runFull(function (text) { el.progressText.textContent = text; },
-            function (p) { el.progressFill.style.width = Math.round(p * 100) + '%'; })
-      .then(function () {
-        el.progressText.textContent = '正在编码 JPEG…';
-        return window.IDP.Export.encode(state.fullCanvas, state.target);
-      })
-      .then(function (info) {
-        window.IDP.Export.download(info.blob, window.IDP.Export.fileName(state.spec.id));
-        state.exportInfo = info;
-        el.progressFill.style.width = '100%';
-        el.progressText.textContent = '完成 · ' + info.kb.toFixed(1) + ' KB';
-        setStage(''); setStageProgress(null);
-        setTimeout(function () { el.progress.hidden = true; }, 1600);
-        el.downloadBtn.disabled = state.overall === 'fail';
-        refreshExportInfo();
-      })
-      .catch(function (e) {
-        el.progress.hidden = true;
-        el.downloadBtn.disabled = state.overall === 'fail';
-        setStage(''); setStageProgress(null);
-        fail(e);
-      });
+  function setLocked(on) {
+    el.controls.classList.toggle('locked', on);
+    el.mainAction.disabled = on;
   }
 
   /* ================= 上传 ================= */
   function handleFile(file) {
     notice(el.uploadNotice, '');
-    setStage('正在读取照片…', true);
+    busy(true, '正在读取照片…');
     readFile(file).then(function (img) {
-      if (!img) return;
+      if (!img) return null;
       if (img.naturalWidth * img.naturalHeight > 1e8) throw new Error('照片分辨率过高（超过 1 亿像素），请先缩小');
       state.fileName = file.name || '';
       state.master = window.IDP.Crop.loadMaster(img);
-      invalidateMatte();
+      state.matte = null; state.matteW = state.matteH = 0;
       resetComposition();
-      setStage('正在检测人脸…', true);
-      return window.IDP.FaceDetect.analyze(state.master);
-    }).then(function (face) {
-      if (face === null) {
-        setStage('');
-        notice(el.uploadNotice, '没有检测到清晰的正脸。请换一张正面免冠、光线均匀、人脸清晰的照片。', 'err');
-        return;
-      }
-      if (!face) return;
-      state.face = face;
+      state.face = null;
+      state.rect = null;
+      state.result = null; state.fullCanvas = null;
+      el.sumBar.hidden = true;
+      el.uploadBox.hidden = true;
+      el.viewwrap.hidden = false;
+      el.cropMeta.hidden = true;
       state.hasPhoto = true;
-      gotoState('photo');
-      setStage('正在处理…');
-      requestAnimationFrame(function () { drawView(); schedulePreview(0); });
-    }).catch(fail);
+      state.gen++;
+      drawView();                       /* 先显示原图，不画裁剪框 */
+      return analyzePhoto();
+    }).catch(function (e) { busy(false); state.analyzing = false; fail(e); });
   }
 
   /* ---------- 三态：未上传 / 已上传 / 重新上传 ---------- */
@@ -512,41 +609,39 @@
     var hit = window.IDP.BG_COLORS.filter(function (c) { return c.hex.toLowerCase() === String(hex).toLowerCase(); })[0];
     return hit ? hit.name : '自定义';
   }
-
   function gotoState(next) {
     if (next === 'idle') {
+      cancelRunning();
       state.hasPhoto = false;
-      state.master = null; state.face = null;
-      state.previewCanvas = null; state.previewBase = null; state.previewMask = null;
-      state.fullCanvas = null; state.metrics = null;
+      state.master = null; state.face = null; state.rect = null;
+      state.matte = null; state.matteW = state.matteH = 0;
+      state.result = null; state.fullCanvas = null; state.metrics = null;
       state.results = []; state.overall = 'pass';
-      invalidateMatte();
+      state.view = 'crop';
+      closeZoom(); closeModal();
       el.uploadBox.hidden = false;
       el.viewwrap.hidden = true;
       el.cropMeta.hidden = true;
       el.sumBar.hidden = true;
-      el.controls.classList.add('locked');
       el.resetBtn.hidden = true;
       el.progress.hidden = true;
-      closeModal();
+      el.controls.classList.add('locked');
+      el.mainAction.disabled = true;
+      el.mainAction.textContent = '预生成';
       notice(el.uploadNotice, ''); notice(el.exportNotice, ''); notice(el.checkNotice, '');
       el.fileInput.value = ''; el.camInput.value = '';
       el.controls.scrollTop = 0;
     } else {
       el.uploadBox.hidden = true;
       el.viewwrap.hidden = false;
-      el.cropMeta.hidden = false;
-      el.sumBar.hidden = false;
-      el.controls.classList.remove('locked');
       el.resetBtn.hidden = false;
-      el.controls.scrollTop = 0;
-      state._fit = null;
-      requestAnimationFrame(function () { drawView(); });
+      el.controls.classList.remove('locked');
+      if (!state.job && !state.analyzing) el.mainAction.disabled = false;
+      applyViewUI();
     }
     updateSpecFade();
   }
 
-  /* 规格卡片横向滚动提示：可滑时右侧出渐变 + 箭头 */
   function updateSpecFade() {
     if (!el.specScroll || !el.specRow) return;
     var more = el.specRow.scrollWidth - el.specRow.clientWidth - el.specRow.scrollLeft > 4;
@@ -556,22 +651,10 @@
   function resetComposition() {
     state.zoom = 1; state.offsetX = 0; state.offsetY = 0;
     state.centerY = state.spec.centerY == null ? D.centerY : state.spec.centerY;
-    state.viewMode = 'adjust';
-    Array.prototype.forEach.call(el.viewMode.children, function (b) {
-      b.classList.toggle('is-on', b.dataset.mode === 'adjust');
-    });
     state._fit = null;
   }
 
-  function setViewMode(mode) {
-    state.viewMode = mode;
-    Array.prototype.forEach.call(el.viewMode.children, function (b) {
-      b.classList.toggle('is-on', b.dataset.mode === mode);
-    });
-    drawView();
-  }
-
-  /* ================= 拖动调参 ================= */
+  /* ================= 拖动 / 缩放（仅裁剪视图，纯几何，零图像处理） ================= */
   function bindDrag() {
     var wrap = el.viewwrap;
     var pointers = {}, start = null, pinchStart = null;
@@ -583,16 +666,13 @@
     function ids() { return Object.keys(pointers); }
 
     wrap.addEventListener('pointerdown', function (e) {
-      if (!state.master) return;
-      /* 指针可能已失效（合成事件 / 已被释放），失败不影响拖动 */
+      if (state.view !== 'crop' || !state.master || !state.rect || state.analyzing || state.job) return;
       try { wrap.setPointerCapture(e.pointerId); } catch (err) { }
       pointers[e.pointerId] = localPos(e);
       if (ids().length === 1) {
         start = { p: localPos(e), o: { x: state.offsetX, y: state.offsetY } };
         state.dragging = true;
         wrap.classList.add('dragging');
-        if (state.viewMode !== 'adjust') setViewMode('adjust');
-        clearTimeout(previewTimer);
         drawView();
       } else if (ids().length === 2) {
         var k = ids();
@@ -612,18 +692,16 @@
         var d = Math.hypot(a.x - b.x, a.y - b.y);
         if (pinchStart.d > 4) {
           state.zoom = clamp(pinchStart.zoom * (d / pinchStart.d), 0.5, 1.3);
-          state.rect = computeRect(); invalidateFull(); drawView(); updateMeta();
+          state.rect = computeRect();
+          updateMeta(); drawView();
         }
         return;
       }
       if (!start || !state.rect) return;
       var s = state._viewScale || 1;
-      var dx = (localPos(e).x - start.p.x) / s;
-      var dy = (localPos(e).y - start.p.y) / s;
-      state.offsetX = start.o.x + dx / state.rect.w;
-      state.offsetY = start.o.y + dy / state.rect.h;
+      state.offsetX = start.o.x + (localPos(e).x - start.p.x) / s / state.rect.w;
+      state.offsetY = start.o.y + (localPos(e).y - start.p.y) / s / state.rect.h;
       state.rect = computeRect();     /* 纯数学，零延迟 */
-      invalidateFull();
       updateMeta();
       drawView();
       e.preventDefault();
@@ -636,10 +714,8 @@
       if (ids().length === 0) {
         state.dragging = false;
         start = null;
-        lastUpAt = performance.now();   /* 量 debounce 用 */
-        invalidateFull();
+        invalidateResult();          /* 取景变了，旧的预生成结果作废 */
         wrap.classList.remove('dragging');
-        schedulePreview(DEBOUNCE_MS);
         drawView();
       }
     }
@@ -648,17 +724,39 @@
     wrap.addEventListener('lostpointercapture', endPointer);
 
     wrap.addEventListener('wheel', function (e) {
-      if (!state.master) return;
+      if (state.view !== 'crop' || !state.master || !state.rect || state.job) return;
       e.preventDefault();
       state.zoom = clamp(state.zoom * (1 - e.deltaY * 0.0012), 0.5, 1.3);
       state.rect = computeRect();
-      invalidateFull();
       updateMeta(); drawView();
-      schedulePreview(DEBOUNCE_MS);
     }, { passive: false });
+
+    /* 结果视图：点一下 → 全屏放大 */
+    wrap.addEventListener('click', function () {
+      if (state.view !== 'result' || state.dragging) return;
+      openZoom();
+    });
   }
 
-  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  /* ================= 点按放大 ================= */
+  function openZoom() {
+    if (state.view !== 'result' || !state.result || !state.result.canvas) return;
+    var c = el.zoomCanvas, src = state.result.canvas;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var W = window.innerWidth, H = window.innerHeight;
+    c.width = Math.round(W * dpr); c.height = Math.round(H * dpr);
+    c.style.width = W + 'px'; c.style.height = H + 'px';
+    var ctx = c.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#0B0B0C';
+    ctx.fillRect(0, 0, W, H);
+    var k = Math.min(W / src.width, H / src.height);
+    var dw = src.width * k, dh = src.height * k;
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(src, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    el.zoomView.hidden = false;
+  }
+  function closeZoom() { el.zoomView.hidden = true; }
 
   /* ================= 上传区绑定 ================= */
   function bindDrop() {
@@ -703,7 +801,7 @@
   function renderSpecRow() {
     if (state.cat === '自定义') {
       el.specRow.hidden = true; el.customSpec.hidden = false;
-      el.specHint.textContent = '输入任意尺寸，毫米按 300 DPI 换算；构图用默认参数（faceRatio 0.65 / centerY 0.42 / 头顶留白 0.05）。';
+      el.specHint.textContent = '输入任意尺寸，毫米按 300 DPI 换算；构图用默认参数（头部占比 0.68 / 头顶留白 0.05）。';
       return;
     }
     el.customSpec.hidden = true; el.specRow.hidden = false;
@@ -724,17 +822,18 @@
     });
     var cur = SPECS.filter(function (s) { return s.id === state.spec.id; })[0];
     el.specHint.textContent = cur
-      ? (cur.note || '') + '　构图：人脸 ' + (cur.faceRatio * 100).toFixed(0) + '% / 居中 ' + cur.centerY + ' / 头顶留白 ' + (cur.topMargin * 100).toFixed(0) + '%'
+      ? (cur.note || '') + '　构图：头部 ' + (cur.faceRatio * 100).toFixed(0) + '% / 居中 ' + cur.centerY + ' / 头顶留白 ' + (cur.topMargin * 100).toFixed(0) + '%'
       : '';
   }
 
   function selectSpec(s) {
+    if (state.view === 'result') return;      /* 规格只在裁剪视图可改 */
     state.spec = s;
     if (s.bg_color) setBg(s.bg_color, true);
     resetComposition();
     renderSpecRow();
-    invalidateFull();
-    if (state.face) { state.rect = computeRect(); drawView(); updateMeta(); schedulePreview(0); }
+    refreshRect();                            /* 复用已算好的 matte 与人脸点，只重算裁剪框 */
+    updateSpecFade();
   }
 
   /* ================= 背景 UI ================= */
@@ -754,8 +853,7 @@
   function setBg(hex, silent) {
     state.bg = hex;
     renderSwatches();
-    state.fullCanvas = null;
-    if (!silent && state.face) schedulePreview(0);
+    if (!silent) scheduleReRender();
   }
 
   /* ================= 控件绑定 ================= */
@@ -766,97 +864,31 @@
       el.mopiHint.textContent = state.intensity * 100 > 28
         ? '已接近上限（' + this.value + '%），建议不超过 28%'
         : '只作用于人脸区域，上限 30%';
-      state.fullCanvas = null;
-      if (state.previewBase && state.previewMask) {
-        state.previewCanvas = window.IDP.Mopi.apply(state.previewBase, {
-          intensity: state.intensity, radius: state.radius, mask: state.previewMask
-        });
-        runCompliance(state.previewCanvas, state.metrics);
-        drawView();
-      }
-      refreshExportInfo();
+      scheduleReRender();
     });
     el.radiusSlider.addEventListener('input', function () {
       state.radius = +this.value;
       el.radiusOut.textContent = this.value + 'px';
-      state.fullCanvas = null;
-      if (state.previewBase && state.previewMask) {
-        state.previewCanvas = window.IDP.Mopi.apply(state.previewBase, {
-          intensity: state.intensity, radius: state.radius, mask: state.previewMask
-        });
-        runCompliance(state.previewCanvas, state.metrics);
-        drawView();
-      }
-    });
-    if (el.ratioSlider) el.ratioSlider.addEventListener('input', function () {
-      state.zoom = clamp((+this.value) / 100, 0.5, 1.3);
-      el.ratioOut.textContent = this.value + '%';
-      invalidateFull();
-      if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(DEBOUNCE_MS); }
-    });
-    if (el.posSlider) el.posSlider.addEventListener('input', function () {
-      state.centerY = (+this.value) / 100;
-      el.posOut.textContent = state.centerY.toFixed(2);
-      invalidateFull();
-      if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(DEBOUNCE_MS); }
-    });
-    Array.prototype.forEach.call(document.querySelectorAll('[data-nudge]'), function (b) {
-      b.addEventListener('click', function () {
-        var d = b.dataset.nudge.split(',');
-        state.offsetX = clamp(state.offsetX + parseFloat(d[0]), -0.4, 0.4);
-        state.offsetY = clamp(state.offsetY + parseFloat(d[1]), -0.4, 0.4);
-        invalidateFull();
-        if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(120); }
-      });
-    });
-    if (el.nudgeReset) el.nudgeReset.addEventListener('click', function () {
-      state.offsetX = 0; state.offsetY = 0;
-      invalidateFull();
-      if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(120); }
+      scheduleReRender();
     });
     el.resetFit.addEventListener('click', function () {
-      resetComposition(); invalidateFull();
-      if (state.face) { state.rect = computeRect(); drawView(); updateMeta(); schedulePreview(120); }
+      if (state.view === 'result') return;
+      resetComposition();
+      refreshRect();
     });
     el.bgCustom.addEventListener('input', function () { setBg(this.value); });
 
-    if (el.hdMatteBtn) el.hdMatteBtn.addEventListener('click', function () {
-      if (state.engine === 'modnet') { setStage('已在使用 MODNet 高精度抠图'); return; }
-      setStage('正在加载 MODNet…', true);
-      setStageProgress(0);
-      window.IDP.BgRemove.ensureModnet(function (t) { setStage(t, true); },
-        function (p) { setStageProgress(0.05 + p * 0.9); })
-        .then(function () {
-          state.engine = 'modnet';
-          invalidateMatte(); updateMatteTag();
-          setStage('MODNet 就绪', false); setStageProgress(null);
-          schedulePreview(0);
-        })
-        .catch(function (e) {
-          state.engine = 'fallback';
-          setStageProgress(null); setStage('');
-          updateMatteTag(e.message);
-          notice(el.uploadNotice, e.message, 'warn');
-        });
+    /* 主按钮：预生成 / 重新裁剪 */
+    el.mainAction.addEventListener('click', function () {
+      if (state.analyzing || state.job) return;
+      preGenerate();
+    });
+    /* 取消 */
+    el.cancelBtn.addEventListener('click', function () {
+      cancelRunning();
+      toast('已取消');
     });
 
-    /* 视图模式 */
-    Array.prototype.forEach.call(el.viewMode.children, function (b) {
-      b.addEventListener('click', function () { setViewMode(b.dataset.mode); });
-    });
-
-    /* 更多 */
-    if (el.moreToggle) el.moreToggle.addEventListener('click', function () {
-      var open = el.moreBody.hidden;
-      el.moreBody.hidden = !open;
-      el.moreToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-      if (window.innerWidth < 768) {
-        el.studio.classList.toggle('sheet-full', true);
-        el.studio.classList.remove('sheet-half', 'sheet-peek');
-      }
-    });
-
-    /* 自定义规格 */
     Array.prototype.forEach.call(el.customUnit.children, function (b) {
       b.addEventListener('click', function () {
         Array.prototype.forEach.call(el.customUnit.children, function (x) { x.classList.remove('is-on'); });
@@ -865,6 +897,7 @@
       });
     });
     el.applyCustom.addEventListener('click', function () {
+      if (state.view === 'result') return;
       var w = parseFloat(el.cw.value), h = parseFloat(el.ch.value);
       if (!(w > 0) || !(h > 0)) { notice(el.uploadNotice, '自定义尺寸必须大于 0', 'err'); return; }
       var wp, hp, wmm, hmm;
@@ -884,8 +917,7 @@
       };
       el.specHint.textContent = '已应用自定义规格 ' + wp + ' × ' + hp + ' px（构图用默认参数）';
       resetComposition();
-      invalidateMatte();
-      if (state.face) { state.rect = computeRect(); drawView(); updateMeta(); schedulePreview(0); }
+      refreshRect();
     });
 
     /* 目标大小 */
@@ -904,21 +936,21 @@
 
     el.downloadBtn.addEventListener('click', function () { doDownload(false); });
 
-    /* 按住对比原图 */
+    /* 按住对比原图（结果视图） */
     function peek(on) {
-      if (!state.previewBase || !state.previewCanvas) return;
-      var canvas = on ? state.previewBase : state.previewCanvas;
-      var tmp = document.createElement('canvas');
-      tmp.width = canvas.width; tmp.height = canvas.height;
-      tmp.getContext('2d').drawImage(canvas, 0, 0);
-      el.viewHint.textContent = on ? '正在显示：未磨皮原图' : '拖动移动取景框 · 滚轮 / 双指缩放';
+      var r = state.result;
+      if (!r || !r.composed || !r.canvas) return;
+      var canvas = on ? r.composed : r.canvas;
       var ctx = el.viewCanvas.getContext('2d');
       var W = el.viewwrap.clientWidth, H = el.viewwrap.clientHeight;
       var dpr = Math.min(window.devicePixelRatio || 1, 2);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, W, H);
-      var s = Math.min(W / tmp.width, H / tmp.height);
-      ctx.drawImage(tmp, (W - tmp.width * s) / 2, (H - tmp.height * s) / 2, tmp.width * s, tmp.height * s);
+      var k = Math.min(W / canvas.width, H / canvas.height);
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(canvas, (W - canvas.width * k) / 2, (H - canvas.height * k) / 2,
+                    canvas.width * k, canvas.height * k);
+      el.viewHint.textContent = on ? '正在显示：未磨皮效果' : '点图片可放大查看';
     }
     ['pointerdown', 'touchstart', 'mousedown'].forEach(function (ev) {
       el.peekBtn.addEventListener(ev, function (e) { e.preventDefault(); peek(true); });
@@ -927,31 +959,8 @@
       el.peekBtn.addEventListener(ev, function () { peek(false); });
     });
 
-    /* 手机端抽屉 */
-    var gripStart = null;
-    if (el.grip) el.grip.addEventListener('pointerdown', function (e) {
-      gripStart = e.clientY; el.grip.setPointerCapture(e.pointerId);
-    });
-    if (el.grip) el.grip.addEventListener('pointerup', function (e) {
-      if (gripStart == null) return;
-      var dy = e.clientY - gripStart;
-      gripStart = null;
-      var cur = el.studio.classList.contains('sheet-full') ? 2
-              : el.studio.classList.contains('sheet-peek') ? 0 : 1;
-      var next = cur;
-      if (dy < -30) next = Math.min(2, cur + 1);
-      else if (dy > 30) next = Math.max(0, cur - 1);
-      else next = cur === 2 ? 1 : 2;
-      el.studio.classList.toggle('sheet-full', next === 2);
-      el.studio.classList.toggle('sheet-half', next === 1);
-      el.studio.classList.toggle('sheet-peek', next === 0);
-      document.body.classList.toggle('sheet-open', next !== 0);
-      setTimeout(drawView, 280);
-    });
-
     window.addEventListener('resize', function () { drawView(); updateSpecFade(); });
     window.addEventListener('orientationchange', function () { setTimeout(function () { drawView(); updateSpecFade(); }, 260); });
-    /* 容器尺寸变化（含窗口缩放）时重设画布，避免拉伸 */
     if (window.ResizeObserver) new ResizeObserver(function () { drawView(); }).observe(el.viewwrap);
 
     /* 校验概要 → 详情浮层 */
@@ -960,26 +969,128 @@
     el.modal.addEventListener('click', function (e) {
       if (e.target.closest('[data-close]')) closeModal();
     });
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      if (!el.zoomView.hidden) closeZoom(); else closeModal();
+    });
     el.modalDownload.addEventListener('click', function () { closeModal(); doDownload(false); });
 
-    /* 换背景：把当前选中的底色显式应用一次并给反馈 */
+    /* 换背景：显式应用一次并给反馈 */
     el.applyBgBtn.addEventListener('click', function () {
       if (!state.hasPhoto) return;
-      state.fullCanvas = null;
-      schedulePreview(0);
-      toast('已应用' + bgName(state.bg) + '背景');
+      if (state.view === 'result') {
+        scheduleReRender();
+        toast('已应用' + bgName(state.bg) + '背景');
+      } else {
+        toast('背景色将在预生成后生效');
+      }
     });
 
-    /* 未上传时点操作区任意位置 → 提示先上传照片 */
+    /* 未上传时点操作区 → 提示先上传照片 */
     el.controls.addEventListener('click', function (e) {
       if (state.hasPhoto) return;
       e.preventDefault(); e.stopPropagation();
       toast('请先上传照片');
     }, true);
 
-    /* 规格卡片横向滚动提示 */
     el.specRow.addEventListener('scroll', updateSpecFade, { passive: true });
+
+    /* 点按放大：点视图任意处退出 */
+    el.zoomView.addEventListener('click', closeZoom);
+  }
+
+  /* ================= 合规 ================= */
+  var ICONS = {
+    pass: '<svg class="ck-icon" viewBox="0 0 24 24" fill="none" stroke="#34C759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5L16 9.5"/></svg>',
+    warn: '<svg class="ck-icon" viewBox="0 0 24 24" fill="none" stroke="#FF9500" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.6l9 15.4H3z"/><path d="M12 9.5v4.2"/><circle cx="12" cy="16.6" r="0.9" fill="#FF9500" stroke="none"/></svg>',
+    fail: '<svg class="ck-icon" viewBox="0 0 24 24" fill="none" stroke="#FF3B30" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>'
+  };
+
+  function runCompliance(canvas, metrics, matte) {
+    if (!canvas || !metrics) return;
+    state.results = window.IDP.Compliance.check(canvas, metrics, {
+      intensity: state.intensity,
+      bgRgb: window.IDP.BgRemove.hexToRgb(state.bg),
+      alpha: matte
+    });
+    state.overall = window.IDP.Compliance.overall(state.results);
+
+    el.checks.innerHTML = state.results.map(function (r) {
+      return '<li class="lv-' + r.level + '">' + ICONS[r.level] +
+        '<div class="ck-body"><div class="ck-name">' + r.name + '</div>' +
+        '<div class="ck-text">' + r.text + '</div></div></li>';
+    }).join('');
+
+    var nWarn = 0, nFail = 0;
+    state.results.forEach(function (r) {
+      if (r.level === 'warn') nWarn++;
+      else if (r.level === 'fail') nFail++;
+    });
+    el.sumBar.className = 'sumbar lv-' + state.overall;
+    el.sumIcon.innerHTML = ICONS[state.overall];
+    el.sumText.textContent = nFail ? (nFail + ' 项不通过') : (nWarn ? (nWarn + ' 项警告') : '符合规范');
+    el.sumBar.hidden = state.view !== 'result';
+
+    var can = state.overall !== 'fail';
+    el.modalDownload.disabled = !can;
+    if (can) {
+      notice(el.checkNotice, state.overall === 'warn'
+        ? '有提醒项，仍可下载；如需通过官方验证建议先按提示调整。' : '', state.overall === 'warn' ? 'warn' : '');
+    } else {
+      el.checkNotice.hidden = false;
+      el.checkNotice.className = 'notice is-err';
+      el.checkNotice.innerHTML = '检测未通过，请先按提示修正。' +
+        ' <button type="button" class="btn btn-ghost btn-sm" id="forceDl" style="min-height:28px;padding:0 10px;font-size:13px;margin-left:6px">仍要下载</button>';
+      var f = document.getElementById('forceDl');
+      if (f) f.addEventListener('click', function () { closeModal(); doDownload(true); });
+    }
+  }
+
+  function openModal() { if (state.view === 'result' && state.result) el.modal.hidden = false; }
+  function closeModal() { el.modal.hidden = true; }
+
+  /* ================= 导出 ================= */
+  var exportTimer = 0;
+  function refreshExportInfo() {
+    clearTimeout(exportTimer);
+    exportTimer = setTimeout(function () {
+      if (state.view !== 'result' || !state.result) { notice(el.exportNotice, ''); return; }
+      var c = resultCanvas();                 /* 规格原始像素，估算即实测 */
+      if (!c) return;
+      window.IDP.Export.encode(c, state.target).then(function (info) {
+        state.exportInfo = info;
+        var t = info.target;
+        var msg = '当前导出 ' + info.kb.toFixed(1) + ' KB（' +
+          c.width + '×' + c.height + 'px，质量 ' + info.quality.toFixed(2) + '）';
+        if (t.max !== Infinity) msg += '，目标 ' + t.min + '–' + t.max + ' KB';
+        var kind = 'ok';
+        if (state.target !== 'none' && !info.ok && info.reason === 'over') {
+          msg += ' —— 已压到最低质量仍超出，可直接下载但不满足目标'; kind = 'err';
+        }
+        if (state.target !== 'none' && !info.ok && info.reason === 'under') {
+          msg += ' —— 低于目标下限，官方系统可能拒收小文件'; kind = 'warn';
+        }
+        notice(el.exportNotice, msg, kind);
+      }).catch(function () { });
+    }, 320);
+  }
+
+  function doDownload(force) {
+    if (state.view !== 'result' || !state.result) { toast('请先点「预生成」'); return; }
+    if (state.overall === 'fail' && !force) return;
+    if (state.job) return;
+    var cv = resultCanvas();                  /* 交付层已缓存，直接编码 */
+    if (!cv) { toast('请先点「预生成」'); return; }
+    el.progress.hidden = false;
+    el.progressFill.style.width = '30%';
+    el.progressText.textContent = '正在编码 JPEG…';
+    window.IDP.Export.encode(cv, state.target).then(function (info) {
+      window.IDP.Export.download(info.blob, window.IDP.Export.fileName(state.spec.id));
+      state.exportInfo = info;
+      el.progressFill.style.width = '100%';
+      el.progressText.textContent = '完成 · ' + info.kb.toFixed(1) + ' KB';
+      setTimeout(function () { el.progress.hidden = true; }, 1600);
+    }).catch(function (e) { el.progress.hidden = true; fail(e); });
   }
 
   /* ================= 启动 ================= */
@@ -999,7 +1110,6 @@
     });
   }
 
-  /* ---------- 启动页：每次访问都显示；两个模型并行下载 + 实时进度 + 最短 1 秒 ---------- */
   function startBootScreen() {
     var attempt = 0, entered = false, t0 = Date.now(), models = null;
     var FILES = window.IDP.Preload.FILES;
@@ -1032,7 +1142,7 @@
       setTimeout(function () { el.boot.hidden = true; drawView(); updateSpecFade(); }, 320);
     }
 
-    function fail(e) {
+    function fail2(e) {
       el.bootStage.textContent = '加载未完成';
       el.bootErr.hidden = false;
       el.bootErr.textContent = attempt >= 3
@@ -1057,10 +1167,9 @@
         models = m;
         el.bootStage.textContent = '准备就绪';
         el.bootEnter.hidden = false;
-        /* 最短显示 1 秒；就绪后再给 1.4s 让用户看到「进入」按钮，不点也会自动进 */
         var wait = Math.max(0, 1000 - (Date.now() - t0));
         setTimeout(enter, wait + 1400);
-      }).catch(fail);
+      }).catch(fail2);
     }
 
     el.bootEnter.addEventListener('click', enter, { once: true });
@@ -1074,27 +1183,54 @@
   else boot();
 
   /* ================= 测试 API ================= */
+  function rectKey() {
+    var r = state.rect;
+    return r ? [Math.round(r.x), Math.round(r.y), Math.round(r.w), Math.round(r.h)].join(',') : '';
+  }
   window.IDPDebug = {
-    ready: function () { return !!(state.master && state.face && state.previewCanvas); },
+    ready: function () { return !!(state.master && state.face && state.rect); },
     state: function () {
+      var r = state.result;
       return {
-        spec: state.spec.id, w: state.spec.width_px, h: state.spec.height_px,
+        view: state.view, spec: state.spec.id, specName: state.spec.name,
+        w: state.spec.width_px, h: state.spec.height_px,
         bg: state.bg, intensity: state.intensity, radius: state.radius, target: state.target,
         overall: state.overall, results: state.results,
         rect: state.rect, metrics: state.metrics,
         zoom: state.zoom, offsetX: state.offsetX, offsetY: state.offsetY,
         centerY: state.centerY, faceRatio: specFor().faceRatio, topMargin: specFor().topMargin,
-        engine: state.engine, viewMode: state.viewMode, dragging: state.dragging,
-        booted: state.booted, hasPhoto: state.hasPhoto,
+        engine: state.engine, dragging: state.dragging,
+        booted: state.booted, hasPhoto: state.hasPhoto, analyzing: state.analyzing,
         bootHidden: !!document.getElementById('boot').hidden,
         uploadBoxVisible: !document.getElementById('uploadBox').hidden,
         viewVisible: !document.getElementById('viewwrap').hidden,
         controlsLocked: document.getElementById('controls').classList.contains('locked'),
+        locked: !!state.job || state.analyzing,
         webgl: window.IDP.Mopi.isWebGL(), faceCount: state.face ? state.face.count : 0,
-        previewSize: state.previewCanvas ? [state.previewCanvas.width, state.previewCanvas.height] : null,
+        matteSize: state.matte ? [state.matteW, state.matteH] : null,
+        resultSize: r && r.canvas ? [r.canvas.width, r.canvas.height] : null,
         fullSize: state.fullCanvas ? [state.fullCanvas.width, state.fullCanvas.height] : null,
-        gen: state.gen, modnetReady: window.IDP.BgRemove.isModnetReady(),
-        busy: previewBusy, timings: state.timings, lastDebounce: state.lastDebounce
+        masterSize: state.master ? [state.master.width, state.master.height] : null,
+        gen: state.gen, renderSeq: state.renderSeq,
+        modnetReady: window.IDP.BgRemove.isModnetReady(),
+        busy: !!state.job, zoomOpen: !document.getElementById('zoomView').hidden,
+        mainLabel: document.getElementById('mainAction').textContent,
+        mainDisabled: document.getElementById('mainAction').disabled,
+        specPickerVisible: !document.getElementById('specPicker').hidden,
+        sumVisible: !document.getElementById('sumBar').hidden,
+        rectKey: rectKey()
+      };
+    },
+    head: function () {
+      var f = state.face; if (!f) return null;
+      return {
+        ovalX: f.ovalBox.x, ovalW: f.ovalBox.w,
+        ovalTop: f.ovalBox.y, ovalH: f.ovalBox.h,
+        hairTop: f.hairTop, headTop: f.headTop, chin: f.chin,
+        headH: f.head.h, hairRatio: f.head.h / f.ovalBox.h,
+        scanX0: f.ovalBox.x - f.ovalBox.w * 0.40,
+        scanX1: f.ovalBox.x + f.ovalBox.w * 1.40,
+        rect: state.rect
       };
     },
     specList: function () {
@@ -1108,7 +1244,8 @@
         return handleFile(new File([b], name || 'test.png', { type: b.type }));
       });
     },
-    /* 构图体检：逐个规格算裁剪框（不跑抠图，纯几何），用于验证「头不出框 + 人脸占比」 */
+    analyzeDone: function () { return !state.analyzing && !!state.face; },
+    /* 逐个规格体检（纯几何，不跑图像处理） */
     checkSpecs: function () {
       var out = [];
       var save = { spec: state.spec, zoom: state.zoom, ox: state.offsetX, oy: state.offsetY, cy: state.centerY };
@@ -1121,7 +1258,8 @@
           faceRatio: +(m.headH / m.H).toFixed(4), wantFaceRatio: s.faceRatio,
           topMargin: +m.topMargin.toFixed(4), wantTopMargin: s.topMargin,
           chinMargin: +m.chinMargin.toFixed(4),
-          headTopOut: +m.top.toFixed(2), chinOut: +m.bottom.toFixed(2)
+          headTopOut: +m.top.toFixed(2), chinOut: +m.bottom.toFixed(2),
+          clamped: !!(rect.w > state.master.width * 1.49 || rect.h > state.master.height * 1.49)
         });
       }
       state.spec = save.spec; state.zoom = save.zoom;
@@ -1129,45 +1267,58 @@
       return out;
     },
     attachFile: function (file) { return handleFile(file); },
+    masterCanvas: function () { return state.master; },
+    matteInfo: function () { return state.matte ? { w: state.matteW, h: state.matteH, data: state.matte } : null; },
     setSpecById: function (id) {
       var s = SPECS.filter(function (x) { return x.id === id; })[0];
       if (!s) throw new Error('unknown spec ' + id);
       selectSpec(s);
+      return state.rect;
     },
     setBg: function (hex) { setBg(hex); },
     setIntensity: function (v) {
       state.intensity = v; el.intenSlider.value = Math.round(v * 100);
       el.intenOut.textContent = Math.round(v * 100) + '%';
-      state.fullCanvas = null;
-      if (state.previewBase && state.previewMask) {
-        state.previewCanvas = window.IDP.Mopi.apply(state.previewBase, {
-          intensity: state.intensity, radius: state.radius, mask: state.previewMask
-        });
-        runCompliance(state.previewCanvas, state.metrics); drawView();
-      }
+      scheduleReRender();
     },
-    setRadius: function (v) { state.radius = v; el.radiusSlider.value = v; el.radiusOut.textContent = v + 'px'; state.fullCanvas = null; },
+    setRadius: function (v) { state.radius = v; el.radiusSlider.value = v; el.radiusOut.textContent = v + 'px'; scheduleReRender(); },
     setTarget: function (id) { state.target = id; refreshExportInfo(); },
     setComposition: function (o) {
+      if (state.view === 'result') state.view = 'crop';
       if (o.zoom != null) state.zoom = o.zoom;
       if (o.offsetX != null) state.offsetX = o.offsetX;
       if (o.offsetY != null) state.offsetY = o.offsetY;
       if (o.centerY != null) state.centerY = o.centerY;
-      invalidateFull();
-      if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(0); }
+      state.rect = computeRect();
+      invalidateResult();
+      updateMeta(); drawView();
       return state.rect;
     },
-    setEngine: function (e) { state.engine = e; invalidateMatte(); updateMatteTag(); schedulePreview(0); },
-    ensureModnet: function () {
-      return window.IDP.BgRemove.ensureModnet(function () { }, function () { });
-    },
-    setViewMode: setViewMode,
-    /* 拖动模拟：直接喂 view 坐标增量，等价于真实 pointer 事件 */
+    setEngine: function (e) { state.engine = e; state.matte = null; updateMatteTag(); },
+    ensureModnet: function () { return window.IDP.BgRemove.ensureModnet(function () { }, function () { }); },
     viewRect: function () { return el.viewwrap.getBoundingClientRect(); },
     viewScale: function () { return state._viewScale; },
-    runFull: function () { return runFull(function () { }, function () { }); },
-    runPreviewNow: function () { return runPreview(); },
+    /* 预生成 / 重新裁剪 */
+    preGenerate: function () { preGenerate(); return waitIdle(); },
+    backToCrop: backToCrop,
+    cancel: cancelRunning,
+    runFull: function () {
+      if (!state.rect) return Promise.resolve(null);
+      return computeResult(null, function () { }, { cancelled: false }).then(function (r) {
+        if (r) { state.fullCanvas = r.canvas; if (state.result) state.result.full = r; }
+        return r ? r.canvas : null;
+      });
+    },
+    resultCanvas: resultCanvas,
+    timings: function () { return state.result ? state.result.timings : null; },
+    openZoom: openZoom, closeZoom: closeZoom,
     gotoState: gotoState,
+    resultLong: resultLong,
+    /* long=null → 规格原始像素；返回 {data,w,h}（w/h 为真实画布尺寸，勿用 long 推算） */
+    alphaForRect: function (long) {
+      var base = window.IDP.Crop.renderCrop(state.master, state.rect, specFor(), long == null ? null : long);
+      return { data: alphaFor(state.rect, base), w: base.width, h: base.height };
+    },
     modelsCached: function () {
       if (typeof caches === 'undefined') return Promise.resolve(null);
       return caches.open(window.IDP.Preload.CACHE).then(function (c) {
@@ -1178,15 +1329,29 @@
     },
     clearModelCache: function () { return window.IDP.Preload.clear(); },
     encode: function () {
-      var cv = state.fullCanvas || state.previewCanvas;
+      var cv = resultCanvas();
       return window.IDP.Export.encode(cv, state.target);
     },
     pngUrl: function (which) {
-      var c = which === 'full' ? state.fullCanvas
-            : which === 'preview' ? state.previewCanvas
-            : which === 'pre' ? state.previewBase
-            : which === 'mask' ? state.previewMask : null;
+      var r = state.result;
+      var c = which === 'full' ? resultCanvas()
+            : which === 'result' ? (r && r.canvas)
+            : which === 'base' ? (r && r.base)
+            : which === 'mask' ? (r && r.mask)
+            : which === 'composed' ? (r && r.composed) : null;
       return c ? c.toDataURL('image/png') : null;
+    },
+    mattePngUrl: function () {
+      if (!state.matte) return null;
+      var c = document.createElement('canvas');
+      c.width = state.matteW; c.height = state.matteH;
+      var d = c.getContext('2d').createImageData(state.matteW, state.matteH);
+      for (var i = 0; i < state.matte.length; i++) {
+        var v = Math.round(clamp(state.matte[i], 0, 1) * 255);
+        d.data[i * 4] = v; d.data[i * 4 + 1] = v; d.data[i * 4 + 2] = v; d.data[i * 4 + 3] = 255;
+      }
+      c.getContext('2d').putImageData(d, 0, 0);
+      return c.toDataURL('image/png');
     },
     alphaStats: function () {
       if (!state.matte) return null;
@@ -1194,13 +1359,12 @@
       for (var i = 0; i < a.length; i++) { if (a[i] > 0.5) n++; if (a[i] > 0.05 && a[i] < 0.95) soft++; }
       return { len: a.length, fgRatio: n / a.length, softRatio: soft / a.length };
     },
-    /* 发丝边缘锐度：过渡带梯度均值，越大越"硬"，越小越自然 */
+    /* 发丝边缘锐度：过渡带梯度均值，越大越"硬" */
     edgeProfile: function () {
-      if (!state.matte) return null;
-      var cv = state.previewBase || state.previewMask;
-      var w = cv ? cv.width : 0, h = cv ? cv.height : 0;
-      if (!w) return null;
-      var a = state.matte, band = 0, sum = 0, n = 0;
+      var r = state.result;
+      if (!r || !r.alpha || !r.base) return null;
+      var w = r.base.width, h = r.base.height, a = r.alpha;
+      var band = 0, sum = 0, n = 0;
       for (var y = 1; y < h - 1; y++) for (var x = 1; x < w - 1; x++) {
         var i = y * w + x;
         if (a[i] < 0.02 || a[i] > 0.98) continue;
@@ -1211,4 +1375,13 @@
       return { bandPixels: band, bandRatio: band / (w * h), meanGrad: n ? sum / n : 0 };
     }
   };
+
+  function waitIdle() {
+    return new Promise(function (res) {
+      (function poll() {
+        if (!state.job && !state.analyzing) return res(state.result);
+        setTimeout(poll, 60);
+      })();
+    });
+  }
 })();

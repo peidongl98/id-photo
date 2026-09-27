@@ -412,6 +412,36 @@
     return n / alpha.length;
   }
 
+  /* 把「整图 matte」里对应裁剪框的那一块，双线性重采样到裁剪输出尺寸。
+     rect 用 matte 像素坐标（可为小数）；落在 matte 之外的部分按背景（0）处理。
+     这样裁剪框怎么拖动都不用重跑 MODNet。 */
+  function sampleMatte(matte, mw, mh, rect, W, H) {
+    var out = new Float32Array(W * H);
+    if (!matte) return out;
+    var xs = rect.w / W, ys = rect.h / H;
+    for (var y = 0; y < H; y++) {
+      var fy = (y + 0.5) * ys + rect.y - 0.5;
+      var y0 = Math.floor(fy), wy = fy - y0;
+      var ya = y0 < 0 ? -1 : (y0 >= mh ? mh : y0);
+      var yb = y0 + 1 < 0 ? -1 : (y0 + 1 >= mh ? mh : y0 + 1);
+      y0 = ya; var y1 = yb;
+      var rowA = y0 < 0 ? null : y0 * mw, rowB = y1 < 0 ? null : y1 * mw;
+      var o = y * W;
+      for (var x = 0; x < W; x++) {
+        var fx = (x + 0.5) * xs + rect.x - 0.5;
+        var x0 = Math.floor(fx), wx = fx - x0;
+        var xa = x0 < 0 ? -1 : (x0 >= mw ? mw : x0);
+        var xb = x0 + 1 < 0 ? -1 : (x0 + 1 >= mw ? mw : x0 + 1);
+        var v00 = rowA == null || xa < 0 ? 0 : matte[rowA + xa];
+        var v01 = rowA == null || xb < 0 ? 0 : matte[rowA + xb];
+        var v10 = rowB == null || xa < 0 ? 0 : matte[rowB + xa];
+        var v11 = rowB == null || xb < 0 ? 0 : matte[rowB + xb];
+        out[o + x] = (v00 * (1 - wx) + v01 * wx) * (1 - wy) + (v10 * (1 - wx) + v11 * wx) * wy;
+      }
+    }
+    return out;
+  }
+
   /* 蒙版软边统计：半透明像素占比越高，发丝过渡越细腻 */
   function softRatio(alpha) {
     var n = 0;
@@ -427,6 +457,7 @@
     isModnetReady: function () { return !!_session; },
     segment: segment,
     composite: composite,
+    sampleMatte: sampleMatte,
     hexToRgb: hexToRgb,
     foregroundRatio: foregroundRatio,
     softRatio: softRatio,

@@ -61,10 +61,6 @@
     <div class="viewwrap" id="viewwrap" hidden>
       <canvas id="viewCanvas"></canvas>
       <div class="viewtools">
-        <div class="seg" id="viewMode">
-          <button type="button" class="seg-btn is-on" data-mode="adjust">构图</button>
-          <button type="button" class="seg-btn" data-mode="result">看效果</button>
-        </div>
         <button type="button" class="btn btn-ghost btn-sm" id="resetFit">重置取景</button>
       </div>
       <button type="button" class="peek" id="peekBtn">对比原图</button>
@@ -76,7 +72,7 @@
     <p class="notice" id="uploadNotice" hidden></p>
   </section>
 
-  <!-- 校验概要行（仅状态 2） -->
+  <!-- 校验概要行（结果视图） -->
   <button type="button" class="sumbar" id="sumBar" hidden>
     <span class="sumbar-icon" id="sumIcon"></span>
     <span class="sumbar-text" id="sumText"></span>
@@ -86,14 +82,24 @@
   <!-- 操作区 -->
   <div class="controls" id="controls">
 
+    <div class="actionrow actionrow-main" id="mainRow">
+      <button type="button" class="btn btn-primary" id="mainAction">预生成</button>
+      <button type="button" class="btn btn-ghost" id="cancelBtn" hidden>取消</button>
+    </div>
+
+    <hr class="sep">
+
     <section class="group">
       <h2 class="group-title">规格</h2>
-      <div class="tabs" id="specTabs"></div>
-      <div class="spec-scroll" id="specScroll">
-        <div class="spec-row" id="specRow"></div>
-        <span class="spec-fade" id="specFade" aria-hidden="true"></span>
+      <p class="hint spec-text" id="specText" hidden></p>
+      <div id="specPicker">
+        <div class="tabs" id="specTabs"></div>
+        <div class="spec-scroll" id="specScroll">
+          <div class="spec-row" id="specRow"></div>
+          <span class="spec-fade" id="specFade" aria-hidden="true"></span>
+        </div>
+        <p class="hint" id="specHint"></p>
       </div>
-      <p class="hint" id="specHint"></p>
       <div class="custom-spec" id="customSpec" hidden>
         <div class="seg" id="customUnit">
           <button type="button" class="seg-btn is-on" data-unit="mm">毫米</button>
@@ -144,6 +150,8 @@
       <p class="hint" id="sizeHint">按目标大小自动调节 JPEG 质量（0.92 → 0.65）</p>
     </section>
 
+    <p class="hint prehint" id="preHint">背景色和磨皮将在预生成后生效</p>
+
     <div class="actionrow">
       <button type="button" class="btn btn-ghost" id="applyBgBtn">换背景</button>
       <button type="button" class="btn btn-primary" id="downloadBtn">下载</button>
@@ -167,6 +175,12 @@
     <p class="notice" id="checkNotice" hidden></p>
     <button type="button" class="btn btn-primary btn-lg" id="modalDownload">下载证件照</button>
   </div>
+</div>
+
+<!-- ==================== 点按放大 ==================== -->
+<div class="zoomview" id="zoomView" hidden>
+  <canvas id="zoomCanvas"></canvas>
+  <p class="zoomtip">点任意处退出</p>
 </div>
 
 <script src="data/specs.js"></script>

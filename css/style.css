@@ -176,18 +176,26 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 
 /* ==================== 操作区 ==================== */
 .controls { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 16px 28px; }
+/* 处理中锁定参数区，但「取消」按钮所在的 #mainRow 必须保持可点 */
 .controls.locked > .group,
 .controls.locked > .sep,
-.controls.locked > .actionrow,
+.controls.locked > .actionrow:not(#mainRow),
 .controls.locked > .btn-block,
+.controls.locked > .hint,
 .controls.locked > .notice { pointer-events: none; opacity: .5; }
 .group { padding: 10px 0 2px; }
 .group-title { margin: 0 0 10px; font-size: 14.5px; font-weight: 600; }
 .sep { border: 0; border-top: 1px solid var(--line); margin: 12px 0 2px; }
 .actionrow { display: flex; gap: 10px; margin-top: 18px; }
 .actionrow .btn { flex: 1 1 0; }
+.actionrow-main { margin-top: 8px; }
+.actionrow-main .btn { min-height: 50px; font-size: 16px; font-weight: 500; }
 .btn-block { width: 100%; margin-top: 10px; }
 .hint { margin: 10px 0 0; font-size: 12.5px; color: var(--ink-2); }
+.prehint { margin: 14px 0 0; text-align: center; }
+.spec-text { margin: 0 0 6px; font-size: 14px; color: var(--ink); font-weight: 500; }
+/* 裁剪视图下「下载」暂不可用（要先预生成），但仍可点出提示 */
+.btn.is-muted { opacity: .45; }
 
 .notice {
   margin: 12px 0 0; padding: 10px 12px; border-radius: var(--r-sm);
@@ -310,6 +318,20 @@ input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 
 .lv-warn .ck-name { color: var(--warn); }
 .lv-fail .ck-name { color: var(--err); }
 .modal-card .btn-lg { margin-top: 10px; }
+
+/* ==================== 点按放大 ==================== */
+.zoomview {
+  position: fixed; inset: 0; z-index: 90;
+  background: #0B0B0C;
+  display: flex; align-items: center; justify-content: center;
+  animation: fadein .16s ease;
+}
+.zoomview canvas { display: block; }
+.zoomtip {
+  position: absolute; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom, 0));
+  transform: translateX(-50%); margin: 0;
+  font-size: 12.5px; color: rgba(255, 255, 255, .6);
+}
 
 /* ==================== 响应式 ==================== */
 @media (min-width: 768px) {
