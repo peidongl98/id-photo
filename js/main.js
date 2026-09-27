@@ -26,7 +26,8 @@
     zoom: 1, offsetX: 0, offsetY: 0, centerY: null,
     rect: null, dragging: false, viewMode: 'adjust',
     /* 结果 */
-    engine: 'fallback',
+    engine: 'modnet',
+    hasPhoto: false,
     matte: null, matteKey: '',
     previewBase: null, previewCanvas: null, previewMask: null,
     fullCanvas: null,
@@ -35,32 +36,37 @@
   };
 
   var el = {};
-  ['stage','stageText','stageBar','stageBarFill','hero','foot','uploadCard','uploadNotice','studio','drop',
-   'pickBtn','shootBtn','fileInput','camInput','stagewrap','viewwrap','viewCanvas','viewHint','busyChip','busyText',
-   'viewMode','cropMeta','resetFit','progress','progressFill','progressText','side','grip','sideScroll','sumPill',
-   'specTabs','specRow','specHint','customSpec','customUnit','cw','ch','applyCustom','swatches','bgCustom',
-   'hdMatteBtn','matteTag','matteHint','intenSlider','intenOut','radiusSlider','radiusOut','peekBtn','mopiHint',
-   'moreToggle','moreBody','sizeChips','sizeHint','ratioSlider','ratioOut','posSlider','posOut','nudgeReset',
-   'checks','checkNotice','downloadBtn','resetBtn','exportNotice'
+  ['boot','bootStage','bootRows','bootErr','bootEnter','bootRetry',
+   'app','display','uploadBox','pickBtn','shootBtn','fileInput','camInput','uploadNotice',
+   'viewwrap','viewCanvas','viewHint','cropMeta','busyChip','busyText','viewMode','resetFit','peekBtn',
+   'sumBar','sumIcon','sumText',
+   'controls','specTabs','specScroll','specFade','specRow','specHint','customSpec','customUnit','cw','ch','applyCustom',
+   'swatches','bgCustom','matteHint','intenSlider','intenOut','radiusSlider','radiusOut','mopiHint',
+   'sizeChips','sizeHint','applyBgBtn','downloadBtn','resetBtn','exportNotice','progress','progressFill','progressText',
+   'modal','modalClose','modalDownload','checks','checkNotice'
   ].forEach(function (id) { el[id] = document.getElementById(id); });
 
-  /* ================= 阶段提示 ================= */
-  var stageTimer = 0;
-  function setStage(text, sticky) {
-    if (text) {
-      el.stageText.textContent = text;
-      el.stage.hidden = false;
-      clearTimeout(stageTimer);
-      if (!sticky) stageTimer = setTimeout(function () { el.stage.hidden = true; }, 3200);
-    } else {
-      el.stage.hidden = true;
-    }
+  /* ================= 轻提示（顶部横条已移除，不再遮挡预览） ================= */
+  var toastEl = null, toastTimer = 0;
+  function toast(text, ms) {
+    if (toastEl) toastEl.parentNode.removeChild(toastEl);
+    toastEl = document.createElement('div');
+    toastEl.className = 'locktoast';
+    toastEl.textContent = text;
+    document.body.appendChild(toastEl);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      if (toastEl && toastEl.parentNode) toastEl.parentNode.removeChild(toastEl);
+      toastEl = null;
+    }, ms || 2000);
   }
-  function setStageProgress(p) {
-    if (p == null) { el.stageBar.hidden = true; return; }
-    el.stageBar.hidden = false;
-    el.stageBarFill.style.width = Math.round(Math.max(0, Math.min(1, p)) * 100) + '%';
+
+  /* 处理阶段：有照片时走预览区内的「处理中…」角标，无照片时用轻提示 */
+  function setStage(text) {
+    if (state.hasPhoto) busy(!!text, text || undefined);
+    else if (text) toast(text, 2000);
   }
+  function setStageProgress() { /* 启动页与导出进度条各自负责，这里不再需要 */ }
   function notice(node, text, kind) {
     if (!text) { node.hidden = true; node.textContent = ''; return; }
     node.hidden = false; node.textContent = text;
@@ -359,8 +365,6 @@
 
   function updateMatteTag(err) {
     var hd = state.engine === 'modnet';
-    el.matteTag.textContent = hd ? 'MODNet' : '标准';
-    el.matteTag.className = 'matte-tag' + (hd ? ' is-hd' : '');
     el.matteHint.textContent = hd
       ? '已启用 MODNet 高精度抠图（模型已缓存，发丝过渡更自然）。'
       : (err ? 'MODNet 加载失败，已自动降级为标准抠图：' + err
@@ -393,23 +397,36 @@
         '<div class="ck-text">' + r.text + '</div></div></li>';
     }).join('');
 
-    el.sumPill.className = 'sum-pill lv-' + state.overall;
-    el.sumPill.innerHTML = ICONS[state.overall] + '<span>' + LV_TEXT[state.overall] + '</span>';
+    /* 概要行：全通过 / N 项警告 / N 项不通过 */
+    var nWarn = 0, nFail = 0;
+    state.results.forEach(function (r) {
+      if (r.level === 'warn') nWarn++;
+      else if (r.level === 'fail') nFail++;
+    });
+    el.sumBar.className = 'sumbar lv-' + state.overall;
+    el.sumIcon.innerHTML = ICONS[state.overall];
+    el.sumText.textContent = nFail ? (nFail + ' 项不通过') : (nWarn ? (nWarn + ' 项警告') : '符合规范');
+    el.sumBar.hidden = !state.hasPhoto;
 
     var can = state.overall !== 'fail';
     el.downloadBtn.disabled = !can;
+    el.modalDownload.disabled = !can;
     if (can) {
       notice(el.checkNotice, state.overall === 'warn'
-        ? '检测有提醒项，仍可下载；如需通过官方验证建议先按提示调整。' : '', state.overall === 'warn' ? 'warn' : '');
+        ? '有提醒项，仍可下载；如需通过官方验证建议先按提示调整。' : '', state.overall === 'warn' ? 'warn' : '');
     } else {
       el.checkNotice.hidden = false;
       el.checkNotice.className = 'notice is-err';
-      el.checkNotice.innerHTML = '检测未通过，下载已停用，请先按上方提示修正。' +
+      el.checkNotice.innerHTML = '检测未通过，下载已停用，请先按提示修正。' +
         ' <button type="button" class="btn btn-ghost btn-sm" id="forceDl" style="min-height:28px;padding:0 10px;font-size:13px;margin-left:6px">仍要下载</button>';
       var f = document.getElementById('forceDl');
-      if (f) f.addEventListener('click', function () { doDownload(true); });
+      if (f) f.addEventListener('click', function () { closeModal(); doDownload(true); });
     }
   }
+
+  /* ---------- 校验详情浮层 ---------- */
+  function openModal() { if (state.hasPhoto) el.modal.hidden = false; }
+  function closeModal() { el.modal.hidden = true; }
 
   /* ================= 导出 ================= */
   var exportTimer = 0;
@@ -483,12 +500,57 @@
       }
       if (!face) return;
       state.face = face;
-      el.uploadCard.hidden = true;
-      el.studio.hidden = false;
-      if (window.innerWidth < 768) { el.studio.classList.add('sheet-half'); document.body.classList.add('sheet-open'); }
-      setStage('正在处理…', true);
+      state.hasPhoto = true;
+      gotoState('photo');
+      setStage('正在处理…');
       requestAnimationFrame(function () { drawView(); schedulePreview(0); });
     }).catch(fail);
+  }
+
+  /* ---------- 三态：未上传 / 已上传 / 重新上传 ---------- */
+  function bgName(hex) {
+    var hit = window.IDP.BG_COLORS.filter(function (c) { return c.hex.toLowerCase() === String(hex).toLowerCase(); })[0];
+    return hit ? hit.name : '自定义';
+  }
+
+  function gotoState(next) {
+    if (next === 'idle') {
+      state.hasPhoto = false;
+      state.master = null; state.face = null;
+      state.previewCanvas = null; state.previewBase = null; state.previewMask = null;
+      state.fullCanvas = null; state.metrics = null;
+      state.results = []; state.overall = 'pass';
+      invalidateMatte();
+      el.uploadBox.hidden = false;
+      el.viewwrap.hidden = true;
+      el.cropMeta.hidden = true;
+      el.sumBar.hidden = true;
+      el.controls.classList.add('locked');
+      el.resetBtn.hidden = true;
+      el.progress.hidden = true;
+      closeModal();
+      notice(el.uploadNotice, ''); notice(el.exportNotice, ''); notice(el.checkNotice, '');
+      el.fileInput.value = ''; el.camInput.value = '';
+      el.controls.scrollTop = 0;
+    } else {
+      el.uploadBox.hidden = true;
+      el.viewwrap.hidden = false;
+      el.cropMeta.hidden = false;
+      el.sumBar.hidden = false;
+      el.controls.classList.remove('locked');
+      el.resetBtn.hidden = false;
+      el.controls.scrollTop = 0;
+      state._fit = null;
+      requestAnimationFrame(function () { drawView(); });
+    }
+    updateSpecFade();
+  }
+
+  /* 规格卡片横向滚动提示：可滑时右侧出渐变 + 箭头 */
+  function updateSpecFade() {
+    if (!el.specScroll || !el.specRow) return;
+    var more = el.specRow.scrollWidth - el.specRow.clientWidth - el.specRow.scrollLeft > 4;
+    el.specScroll.classList.toggle('can-scroll', more);
   }
 
   function resetComposition() {
@@ -498,9 +560,6 @@
     Array.prototype.forEach.call(el.viewMode.children, function (b) {
       b.classList.toggle('is-on', b.dataset.mode === 'adjust');
     });
-    el.ratioSlider.value = 100; el.ratioOut.textContent = '100%';
-    el.posSlider.value = Math.round(state.centerY * 100);
-    el.posOut.textContent = state.centerY.toFixed(2);
     state._fit = null;
   }
 
@@ -525,7 +584,8 @@
 
     wrap.addEventListener('pointerdown', function (e) {
       if (!state.master) return;
-      wrap.setPointerCapture(e.pointerId);
+      /* 指针可能已失效（合成事件 / 已被释放），失败不影响拖动 */
+      try { wrap.setPointerCapture(e.pointerId); } catch (err) { }
       pointers[e.pointerId] = localPos(e);
       if (ids().length === 1) {
         start = { p: localPos(e), o: { x: state.offsetX, y: state.offsetY } };
@@ -552,8 +612,6 @@
         var d = Math.hypot(a.x - b.x, a.y - b.y);
         if (pinchStart.d > 4) {
           state.zoom = clamp(pinchStart.zoom * (d / pinchStart.d), 0.5, 1.3);
-          el.ratioSlider.value = Math.round(state.zoom * 100);
-          el.ratioOut.textContent = Math.round(state.zoom * 100) + '%';
           state.rect = computeRect(); invalidateFull(); drawView(); updateMeta();
         }
         return;
@@ -593,8 +651,6 @@
       if (!state.master) return;
       e.preventDefault();
       state.zoom = clamp(state.zoom * (1 - e.deltaY * 0.0012), 0.5, 1.3);
-      el.ratioSlider.value = Math.round(state.zoom * 100);
-      el.ratioOut.textContent = Math.round(state.zoom * 100) + '%';
       state.rect = computeRect();
       invalidateFull();
       updateMeta(); drawView();
@@ -606,18 +662,18 @@
 
   /* ================= 上传区绑定 ================= */
   function bindDrop() {
-    el.drop.addEventListener('click', function (e) { if (!e.target.closest('button')) el.fileInput.click(); });
+    el.uploadBox.addEventListener('click', function (e) { if (!e.target.closest('button')) el.fileInput.click(); });
     el.pickBtn.addEventListener('click', function (e) { e.stopPropagation(); el.fileInput.click(); });
     el.shootBtn.addEventListener('click', function (e) { e.stopPropagation(); el.camInput.click(); });
     el.fileInput.addEventListener('change', function () { if (this.files[0]) handleFile(this.files[0]); this.value = ''; });
     el.camInput.addEventListener('change', function () { if (this.files[0]) handleFile(this.files[0]); this.value = ''; });
     ['dragenter', 'dragover'].forEach(function (ev) {
-      el.drop.addEventListener(ev, function (e) { e.preventDefault(); el.drop.classList.add('is-over'); });
+      el.uploadBox.addEventListener(ev, function (e) { e.preventDefault(); el.uploadBox.classList.add('is-over'); });
     });
     ['dragleave', 'drop'].forEach(function (ev) {
-      el.drop.addEventListener(ev, function (e) { e.preventDefault(); el.drop.classList.remove('is-over'); });
+      el.uploadBox.addEventListener(ev, function (e) { e.preventDefault(); el.uploadBox.classList.remove('is-over'); });
     });
-    el.drop.addEventListener('drop', function (e) {
+    el.uploadBox.addEventListener('drop', function (e) {
       var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
       if (f) handleFile(f);
     });
@@ -631,17 +687,7 @@
         }
       }
     });
-    el.resetBtn.addEventListener('click', function () {
-      el.studio.hidden = true;
-      el.studio.classList.remove('sheet-half', 'sheet-full', 'sheet-peek');
-      document.body.classList.remove('sheet-open');
-      el.uploadCard.hidden = false;
-      notice(el.uploadNotice, ''); notice(el.exportNotice, ''); notice(el.checkNotice, '');
-      state.master = null; state.face = null;
-      state.previewCanvas = null; state.fullCanvas = null;
-      invalidateMatte();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    });
+    el.resetBtn.addEventListener('click', function () { gotoState('idle'); });
   }
 
   /* ================= 规格 UI ================= */
@@ -742,13 +788,13 @@
         drawView();
       }
     });
-    el.ratioSlider.addEventListener('input', function () {
+    if (el.ratioSlider) el.ratioSlider.addEventListener('input', function () {
       state.zoom = clamp((+this.value) / 100, 0.5, 1.3);
       el.ratioOut.textContent = this.value + '%';
       invalidateFull();
       if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(DEBOUNCE_MS); }
     });
-    el.posSlider.addEventListener('input', function () {
+    if (el.posSlider) el.posSlider.addEventListener('input', function () {
       state.centerY = (+this.value) / 100;
       el.posOut.textContent = state.centerY.toFixed(2);
       invalidateFull();
@@ -763,7 +809,7 @@
         if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(120); }
       });
     });
-    el.nudgeReset.addEventListener('click', function () {
+    if (el.nudgeReset) el.nudgeReset.addEventListener('click', function () {
       state.offsetX = 0; state.offsetY = 0;
       invalidateFull();
       if (state.face) { state.rect = computeRect(); updateMeta(); drawView(); schedulePreview(120); }
@@ -774,7 +820,7 @@
     });
     el.bgCustom.addEventListener('input', function () { setBg(this.value); });
 
-    el.hdMatteBtn.addEventListener('click', function () {
+    if (el.hdMatteBtn) el.hdMatteBtn.addEventListener('click', function () {
       if (state.engine === 'modnet') { setStage('已在使用 MODNet 高精度抠图'); return; }
       setStage('正在加载 MODNet…', true);
       setStageProgress(0);
@@ -800,7 +846,7 @@
     });
 
     /* 更多 */
-    el.moreToggle.addEventListener('click', function () {
+    if (el.moreToggle) el.moreToggle.addEventListener('click', function () {
       var open = el.moreBody.hidden;
       el.moreBody.hidden = !open;
       el.moreToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -883,10 +929,10 @@
 
     /* 手机端抽屉 */
     var gripStart = null;
-    el.grip.addEventListener('pointerdown', function (e) {
+    if (el.grip) el.grip.addEventListener('pointerdown', function (e) {
       gripStart = e.clientY; el.grip.setPointerCapture(e.pointerId);
     });
-    el.grip.addEventListener('pointerup', function (e) {
+    if (el.grip) el.grip.addEventListener('pointerup', function (e) {
       if (gripStart == null) return;
       var dy = e.clientY - gripStart;
       gripStart = null;
@@ -903,10 +949,37 @@
       setTimeout(drawView, 280);
     });
 
-    window.addEventListener('resize', function () { drawView(); });
-    window.addEventListener('orientationchange', function () { setTimeout(drawView, 260); });
-    /* 抽屉展开 / 收起会改变预览行高度，用 ResizeObserver 兜住所有尺寸变化 */
+    window.addEventListener('resize', function () { drawView(); updateSpecFade(); });
+    window.addEventListener('orientationchange', function () { setTimeout(function () { drawView(); updateSpecFade(); }, 260); });
+    /* 容器尺寸变化（含窗口缩放）时重设画布，避免拉伸 */
     if (window.ResizeObserver) new ResizeObserver(function () { drawView(); }).observe(el.viewwrap);
+
+    /* 校验概要 → 详情浮层 */
+    el.sumBar.addEventListener('click', openModal);
+    el.modalClose.addEventListener('click', closeModal);
+    el.modal.addEventListener('click', function (e) {
+      if (e.target.closest('[data-close]')) closeModal();
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+    el.modalDownload.addEventListener('click', function () { closeModal(); doDownload(false); });
+
+    /* 换背景：把当前选中的底色显式应用一次并给反馈 */
+    el.applyBgBtn.addEventListener('click', function () {
+      if (!state.hasPhoto) return;
+      state.fullCanvas = null;
+      schedulePreview(0);
+      toast('已应用' + bgName(state.bg) + '背景');
+    });
+
+    /* 未上传时点操作区任意位置 → 提示先上传照片 */
+    el.controls.addEventListener('click', function (e) {
+      if (state.hasPhoto) return;
+      e.preventDefault(); e.stopPropagation();
+      toast('请先上传照片');
+    }, true);
+
+    /* 规格卡片横向滚动提示 */
+    el.specRow.addEventListener('scroll', updateSpecFade, { passive: true });
   }
 
   /* ================= 启动 ================= */
@@ -914,10 +987,87 @@
     renderTabs(); renderSpecRow(); renderSwatches();
     bindDrop(); bindControls(); bindDrag();
     updateMatteTag();
+    gotoState('idle');
+    registerSW();
+    startBootScreen();
+  }
 
-    setStage('正在加载人脸检测模型…', true);
-    window.IDP.FaceDetect.ensure().then(function () { setStage(''); })
-      .catch(function (e) { setStage(''); notice(el.uploadNotice, e.message + '。可以刷新页面重试。', 'err'); });
+  function registerSW() {
+    if (!('serviceWorker' in navigator)) return;
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('sw.js').catch(function () { });
+    });
+  }
+
+  /* ---------- 启动页：每次访问都显示；两个模型并行下载 + 实时进度 + 最短 1 秒 ---------- */
+  function startBootScreen() {
+    var attempt = 0, entered = false, t0 = Date.now(), models = null;
+    var FILES = window.IDP.Preload.FILES;
+
+    el.bootRows.innerHTML = FILES.map(function (f) {
+      return '<div class="boot-row" data-id="' + f.id + '">' +
+        '<div class="boot-line"><span class="boot-label">' + f.label + '</span><span class="boot-pct">0%</span></div>' +
+        '<div class="boot-track"><i></i></div></div>';
+    }).join('');
+
+    function setP(id, p, cached) {
+      var row = el.bootRows.querySelector('[data-id="' + id + '"]');
+      if (!row) return;
+      row.querySelector('.boot-track i').style.width = Math.round(p * 100) + '%';
+      var pct = row.querySelector('.boot-pct');
+      if (pct) pct.textContent = cached ? '已缓存' : Math.round(p * 100) + '%';
+      if (p >= 1) row.classList.add('is-done');
+    }
+
+    function enter() {
+      if (entered) return;
+      entered = true;
+      if (models) {
+        if (window.IDP.FaceDetect.setModelBuffer) window.IDP.FaceDetect.setModelBuffer(models.face);
+        if (window.IDP.BgRemove.setModnetBuffer) window.IDP.BgRemove.setModnetBuffer(models.modnet);
+      }
+      el.boot.classList.add('is-gone');
+      el.app.hidden = false;
+      state.booted = true;
+      setTimeout(function () { el.boot.hidden = true; drawView(); updateSpecFade(); }, 320);
+    }
+
+    function fail(e) {
+      el.bootStage.textContent = '加载未完成';
+      el.bootErr.hidden = false;
+      el.bootErr.textContent = attempt >= 3
+        ? '网络异常，请检查后刷新页面（已重试 3 次）'
+        : ('模型加载失败：' + ((e && e.message) || e));
+      el.bootRetry.hidden = attempt >= 3;
+    }
+
+    function start() {
+      attempt++;
+      el.bootErr.hidden = true;
+      el.bootRetry.hidden = true;
+      el.bootEnter.hidden = true;
+      el.bootStage.textContent = '正在准备模型…';
+      Array.prototype.forEach.call(el.bootRows.querySelectorAll('.boot-row'), function (r) {
+        r.classList.remove('is-done');
+        r.querySelector('.boot-track i').style.width = '0%';
+        r.querySelector('.boot-pct').textContent = '0%';
+      });
+      if (attempt === 1) t0 = Date.now();
+      window.IDP.Preload.loadAll(setP).then(function (m) {
+        models = m;
+        el.bootStage.textContent = '准备就绪';
+        el.bootEnter.hidden = false;
+        /* 最短显示 1 秒；就绪后再给 1.4s 让用户看到「进入」按钮，不点也会自动进 */
+        var wait = Math.max(0, 1000 - (Date.now() - t0));
+        setTimeout(enter, wait + 1400);
+      }).catch(fail);
+    }
+
+    el.bootEnter.addEventListener('click', enter, { once: true });
+    el.bootRetry.addEventListener('click', function () {
+      window.IDP.Preload.clear().then(start);
+    });
+    start();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
@@ -935,6 +1085,11 @@
         zoom: state.zoom, offsetX: state.offsetX, offsetY: state.offsetY,
         centerY: state.centerY, faceRatio: specFor().faceRatio, topMargin: specFor().topMargin,
         engine: state.engine, viewMode: state.viewMode, dragging: state.dragging,
+        booted: state.booted, hasPhoto: state.hasPhoto,
+        bootHidden: !!document.getElementById('boot').hidden,
+        uploadBoxVisible: !document.getElementById('uploadBox').hidden,
+        viewVisible: !document.getElementById('viewwrap').hidden,
+        controlsLocked: document.getElementById('controls').classList.contains('locked'),
         webgl: window.IDP.Mopi.isWebGL(), faceCount: state.face ? state.face.count : 0,
         previewSize: state.previewCanvas ? [state.previewCanvas.width, state.previewCanvas.height] : null,
         fullSize: state.fullCanvas ? [state.fullCanvas.width, state.fullCanvas.height] : null,
@@ -1012,6 +1167,16 @@
     viewScale: function () { return state._viewScale; },
     runFull: function () { return runFull(function () { }, function () { }); },
     runPreviewNow: function () { return runPreview(); },
+    gotoState: gotoState,
+    modelsCached: function () {
+      if (typeof caches === 'undefined') return Promise.resolve(null);
+      return caches.open(window.IDP.Preload.CACHE).then(function (c) {
+        return Promise.all(window.IDP.Preload.FILES.map(function (f) {
+          return c.match(f.url).then(function (r) { return r ? f.id + ':hit' : f.id + ':miss'; });
+        }));
+      });
+    },
+    clearModelCache: function () { return window.IDP.Preload.clear(); },
     encode: function () {
       var cv = state.fullCanvas || state.previewCanvas;
       return window.IDP.Export.encode(cv, state.target);
