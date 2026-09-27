@@ -26,6 +26,8 @@
     'uniform float u_sigmaColor;',
     'uniform float u_intensity;',
     'uniform float u_blend;',
+    'uniform float u_restore;',
+    'vec3 at(vec2 o){ return texture2D(u_src, v_uv + o).rgb; }',
     'void main(){',
     '  vec4 c0 = texture2D(u_src, v_uv);',
     '  float m = texture2D(u_mask, v_uv).r;',
@@ -49,7 +51,17 @@
     '    }',
     '  }',
     '  vec3 f = acc / max(wsum, 1e-5);',
-    '  gl_FragColor = vec4(mix(c0.rgb, f, u_blend), 1.0);',
+    /* 1–2px 高频层：3×3 二项式低通取差值。频率分离的关键：
+       双边把「痘（6–9px 中频结构）」连同「毛孔（1–2px 高频）」一起抹掉，
+       再把高频层按 u_restore 补回 —— 痘走掉、毛孔留下。 */
+    '  vec2 tx = u_texel;',
+    '  vec3 bl = (at(vec2(0.0, 0.0)) * 4.0',
+    '          + (at(vec2(-tx.x, 0.0)) + at(vec2(tx.x, 0.0)) + at(vec2(0.0, -tx.y)) + at(vec2(0.0, tx.y))) * 2.0',
+    '          + at(vec2(-tx.x, -tx.y)) + at(vec2(tx.x, -tx.y)) + at(vec2(-tx.x, tx.y)) + at(vec2(tx.x, tx.y))) / 16.0;',
+    '  vec3 hp = c0.rgb - bl;',
+    '  float k = u_blend * m;',
+    '  vec3 outc = mix(c0.rgb, f, k) + hp * k * u_restore;',
+    '  gl_FragColor = vec4(clamp(outc, 0.0, 1.0), 1.0);',
     '}'
   ].join('\n');
 
@@ -57,11 +69,14 @@
   var loc = {}, quad = null;
   var supported = null;
 
-  /* 可调参数：sigmaScale 放大空间核、blendScale 把强度映射到混合比例、passes 级联次数。
-     单遍小核（σ_space = radius×0.6 ≈ 1.8px）只够抹 1–2px 噪点，抹不动输出图上 5–9px 的真实痘痘；
-     故用「同一核级联 2 次 + 强度映射 ×3.33」把有效作用尺度推到达标区间。
-     σ_color 恒为 0.08 不变 —— 实测痣/疤被改动 <6%、五官强梯度保留 >99%。 */
-  var params = { sigmaScale: 1, blendScale: 3.33, passes: 2 };
+  /* 可调参数：
+     sigmaScale  放大空间核；blendScale 把强度映射到混合比例；passes 级联次数；
+     restore     高频回填系数（频率分离核心）——
+                 0 = 老行为（高频一起被压掉，毛孔消失）；
+                 1 = 高频完整保留，只有 6–9px 的痘被削。
+     σ_color 恒为 0.08（规格），σ_space 恒 = radius×0.6（规格）。
+     级联对「中频（痘）」是乘法削减，对「高频（毛孔）」被 restore 抵消 → 两遍只加强去痘，不额外伤毛孔。 */
+  var params = { sigmaScale: 1, blendScale: 3.33, passes: 2, restore: 0.85 };
 
   function init() {
     if (supported !== null) return supported;
@@ -106,7 +121,8 @@
         ss: gl.getUniformLocation(prog, 'u_sigmaSpace'),
         sc: gl.getUniformLocation(prog, 'u_sigmaColor'),
         inten: gl.getUniformLocation(prog, 'u_intensity'),
-        blend: gl.getUniformLocation(prog, 'u_blend')
+        blend: gl.getUniformLocation(prog, 'u_blend'),
+        restore: gl.getUniformLocation(prog, 'u_restore')
       };
 
       texSrc = makeTex(); texMask = makeTex();
@@ -165,6 +181,7 @@
       gl.uniform1i(loc.radius, Math.max(1, Math.min(5, Math.round(r))));
       gl.uniform1f(loc.ss, Math.max(0.6, r * 0.6));
       gl.uniform1f(loc.blend, Math.max(0, Math.min(1, intensity * params.blendScale)));
+      gl.uniform1f(loc.restore, Math.max(0, Math.min(1, params.restore)));
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       outCtx.drawImage(canvas, 0, 0);
       cur = out;
@@ -187,6 +204,17 @@
     var R = Math.max(1, Math.min(5, Math.round(opts.radius)));
     var ss2 = 2 * (R * 0.6) * (R * 0.6), sc2 = 2 * 0.08 * 0.08;
     var d = src.data;
+    var restore = Math.max(0, Math.min(1, params.restore == null ? 1 : params.restore));
+
+    /* 1–2px 高频层（3×3 二项式低通与自身的差）—— 与 shader 同一口径 */
+    function blur3(x, y, c) {
+      var xl = x > 0 ? x - 1 : x, xr = x < w - 1 ? x + 1 : x;
+      var yt = y > 0 ? y - 1 : y, yb = y < h - 1 ? y + 1 : y;
+      var s = d[(yt * w + xl) * 4 + c] + d[(yt * w + x) * 4 + c] + d[(yt * w + xr) * 4 + c]
+            + 2 * (d[(y * w + xl) * 4 + c] + d[(y * w + x) * 4 + c] + d[(y * w + xr) * 4 + c])
+            + d[(yb * w + xl) * 4 + c] + d[(yb * w + x) * 4 + c] + d[(yb * w + xr) * 4 + c];
+      return s / 16;
+    }
 
     var x0 = w, x1 = 0, y0 = h, y1 = 0, any = false;
     for (var y = 0; y < h; y++) {
@@ -220,9 +248,13 @@
         }
         if (ws <= 0) continue;
         var t = Math.max(0, Math.min(1, opts.intensity * params.blendScale * m));
-        dst[i] = r0 + (ar / ws - r0) * t;
-        dst[i + 1] = g0 + (ag / ws - g0) * t;
-        dst[i + 2] = b0 + (ab / ws - b0) * t;
+        /* 频率分离：双边结果 + 高频层回填 */
+        for (var c = 0; c < 3; c++) {
+          var o0 = d[i + c];
+          var hp = o0 - blur3(x, y, c);
+          var v = o0 + ((c === 0 ? ar : c === 1 ? ag : ab) / ws - o0) * t + hp * t * restore;
+          dst[i + c] = v < 0 ? 0 : (v > 255 ? 255 : v);
+        }
       }
     }
     ctx.putImageData(new ImageData(dst, w, h), 0, 0);
