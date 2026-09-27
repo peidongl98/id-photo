@@ -357,3 +357,15 @@ input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 
   .viewhint { display: none; }
   .slider-row label { flex-basis: 72px; font-size: 13px; }
 }
+
+/* ==================== 桌面端（≥768px）====================
+   规格卡片在窄屏是单行横滑 —— 手机上用触摸滑动很自然，但桌面端不行：
+   鼠标滚轮在这里滚的是整个操作区（纵向）、滚动条被 scrollbar-width:none 藏掉、
+   右侧「›」又是 pointer-events:none 的纯装饰 —— 结果「中国常用」10 档里
+   藏起来的那几档根本点不到。桌面端改为换行铺开，一屏看全。 */
+@media (min-width: 768px) {
+  .spec-row { flex-wrap: wrap; overflow-x: visible; padding-bottom: 4px; }
+  .spec { flex: 0 1 calc(25% - 7.5px); width: auto; }   /* 每行 4 张，正好铺满 */
+  .spec-scroll .spec-fade { display: none; }             /* 不再横滑，渐变箭头无意义 */
+  .tabs { flex-wrap: wrap; overflow-x: visible; padding-bottom: 8px; }
+}
