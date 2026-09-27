@@ -13,15 +13,20 @@
       w: 'https://unpkg.com/@mediapipe/tasks-vision@' + VERSION + '/wasm' }
   ];
 
-  /* 模型：优先本地同源（大陆可直连），失败回退官方 CDN */
-  var FACE_MODEL = [
-    'assets/models/face_landmarker.task',
-    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
-  ];
-  var SEG_MODEL = [
-    'assets/models/selfie_segmenter.tflite',
-    'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite'
-  ];
+  /* 模型：同域相对路径（/models/），由启动页统一预加载并写入 Cache Storage。
+     不再走外部 CDN —— 官方源 storage.googleapis.com 在大陆不可直连。 */
+  var FACE_MODEL = ['models/face_landmarker.task'];
+  var SEG_MODEL = ['models/selfie_segmenter.tflite'];
+
+  /* 启动页会把已下载的模型 buffer 交进来，转成 blob URL 直接喂给 MediaPipe，避免二次下载 */
+  var _modelUrl = null;
+  function setModelBuffer(buf) {
+    if (!buf || !window.Blob || !window.URL || !URL.createObjectURL) return;
+    _modelUrl = URL.createObjectURL(new Blob([buf], { type: 'application/octet-stream' }));
+  }
+  function modelSources() {
+    return _modelUrl ? [_modelUrl].concat(FACE_MODEL) : FACE_MODEL;
+  }
 
   /* MediaPipe 脸部轮廓关键点（FACEMESH_FACE_OVAL） */
   var OVAL_IDX = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,
@@ -77,7 +82,7 @@
           runningMode: 'IMAGE',
           numFaces: 1
         });
-      }, FACE_MODEL).then(function (lm) { _landmarker = lm; return lm; });
+      }, modelSources()).then(function (lm) { _landmarker = lm; return lm; });
     });
   }
 
@@ -127,6 +132,7 @@
   window.IDP.FaceDetect = {
     ensure: ensureLandmarker,
     analyze: analyze,
+    setModelBuffer: setModelBuffer,
     OVAL_IDX: OVAL_IDX,
     SEG_MODEL: SEG_MODEL
   };

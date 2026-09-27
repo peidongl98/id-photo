@@ -11,11 +11,14 @@
     'https://unpkg.com/onnxruntime-web@' + ORT_V + '/dist/ort.min.js'
   ];
   var ORT_WASM = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@' + ORT_V + '/dist/';
-  /* 模型本地同源托管：官方源需翻墙，走外部 CDN 在大陆等于打不开 */
-  var MODNET_URLS = [
-    'assets/models/modnet.onnx',
-    'https://hf-mirror.com/Xenova/modnet/resolve/main/onnx/model_quantized.onnx'
-  ];
+  /* 模型同域相对路径（/models/），由启动页统一预加载；不走任何外部 CDN */
+  var MODNET_URLS = ['models/modnet.onnx'];
+
+  /* 启动页把已下载的 model.onnx 原始 buffer 交进来，直接建 session，不重新下载 */
+  var _modnetBuffer = null;
+  function setModnetBuffer(buf) {
+    if (buf && buf.byteLength) _modnetBuffer = buf;
+  }
   var SEG_SHORT = 512, SEG_LONG_CAP = 1024;
 
   var _ortP = null, _session = null, _modnetP = null, _seg = null, _segP = null;
@@ -106,14 +109,16 @@
     if (_session) return Promise.resolve(_session);
     if (_modnetP) return _modnetP;
     _modnetP = loadOrt(onStage).then(function (ort) {
-      if (onStage) onStage('正在加载 MODNet 模型…');
+      if (onStage) onStage('正在初始化 MODNet…');
       var chain = Promise.reject();
       var lastErr = null;
-      MODNET_URLS.forEach(function (url) {
+      var sources = _modnetBuffer ? [{ buf: _modnetBuffer }] : MODNET_URLS.map(function (u) { return { url: u }; });
+      sources.forEach(function (src) {
         chain = chain.catch(function () {
-          return fetchWithProgress(url, function (p) {
-            if (onProgress) onProgress(p);
-          }).then(function (buf) {
+          var getBuf = src.buf
+            ? Promise.resolve(src.buf)
+            : fetchWithProgress(src.url, function (p) { if (onProgress) onProgress(p); });
+          return getBuf.then(function (buf) {
             if (onStage) onStage('正在初始化 MODNet…');
             return ort.InferenceSession.create(buf, {
               executionProviders: ['wasm'],
@@ -417,6 +422,7 @@
   window.IDP = window.IDP || {};
   window.IDP.BgRemove = {
     ensureModnet: ensureModnet,
+    setModnetBuffer: setModnetBuffer,
     ensureFallback: ensureFallback,
     isModnetReady: function () { return !!_session; },
     segment: segment,

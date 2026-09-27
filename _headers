@@ -1,0 +1,15 @@
+# Cloudflare Pages 响应头配置（缩进两个空格，Pages 自动识别）
+
+/models/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Service Worker 不能被长缓存，否则版本更新无法生效
+/sw.js
+  Cache-Control: no-cache
+
+# 入口 HTML 走短缓存，保证发版后能拿到新版本
+/
+  Cache-Control: public, max-age=0, must-revalidate
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
