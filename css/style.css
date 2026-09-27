@@ -156,6 +156,24 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 
 .viewmeta { flex: 0 0 auto; margin: 6px 2px 0; font-size: 12px; color: var(--ink-2); }
 
+/* ==================== 校验概要行 ==================== */
+.sumbar {
+  flex: 0 0 auto; height: 40px; margin: 10px 16px 6px;
+  display: flex; align-items: center; gap: 9px;
+  padding: 0 14px; border-radius: var(--r-md);
+  border: 1px solid var(--line); background: var(--card);
+  font-size: 13.5px; font-weight: 500; cursor: pointer; text-align: left;
+  transition: border-color .16s ease, background .16s ease;
+}
+.sumbar:hover { border-color: #c9c9ce; }
+.sumbar-icon { flex: 0 0 auto; width: 18px; height: 18px; display: inline-flex; }
+.sumbar-icon svg { width: 18px; height: 18px; }
+.sumbar-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sumbar-arrow { flex: 0 0 auto; color: var(--ink-2); font-size: 18px; line-height: 1; }
+.sumbar.lv-pass { color: #1D7A38; border-color: rgba(52, 199, 89, .42); background: rgba(52, 199, 89, .07); }
+.sumbar.lv-warn { color: #9A5B00; border-color: rgba(255, 149, 0, .42); background: rgba(255, 149, 0, .08); }
+.sumbar.lv-fail { color: #B32017; border-color: rgba(255, 59, 48, .42); background: rgba(255, 59, 48, .07); }
+
 /* ==================== 操作区 ==================== */
 .controls { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 16px 28px; }
 .controls.locked > .group,
@@ -251,6 +269,35 @@ input[type=range]::-webkit-slider-thumb {
 }
 input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line); }
 input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 1px solid rgba(0, 0, 0, .08); }
+
+/* ==================== 校验详情浮层 ==================== */
+.modal { position: fixed; inset: 0; z-index: 70; display: flex; align-items: flex-end; justify-content: center; }
+.modal-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, .35); animation: fadein .2s ease; }
+@keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+.modal-card {
+  position: relative; width: 100%; max-width: 620px; max-height: 78svh;
+  background: var(--card); border-radius: 20px 20px 0 0;
+  padding: 18px 18px calc(18px + env(safe-area-inset-bottom, 0));
+  display: flex; flex-direction: column;
+  animation: slideup .26s cubic-bezier(.22, 1, .36, 1);
+  box-shadow: 0 -8px 30px rgba(0, 0, 0, .16);
+}
+@keyframes slideup { from { transform: translateY(24px); opacity: .6; } to { transform: translateY(0); opacity: 1; } }
+.modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.modal-head h3 { margin: 0; font-size: 16px; font-weight: 600; }
+.modal-x { width: 36px; height: 36px; border: 0; background: transparent; color: var(--ink-2); font-size: 17px; cursor: pointer; border-radius: 50%; }
+.modal-x:hover { background: #F2F2F5; }
+.checks { list-style: none; margin: 0 0 8px; padding: 0; overflow-y: auto; }
+.checks li { display: flex; align-items: flex-start; gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.checks li:last-child { border-bottom: 0; }
+.ck-icon { flex: 0 0 auto; width: 20px; height: 20px; margin-top: 1px; }
+.ck-body { min-width: 0; }
+.ck-name { font-weight: 500; font-size: 14px; }
+.ck-text { font-size: 13px; color: var(--ink-2); }
+.lv-pass .ck-name { color: var(--ok); }
+.lv-warn .ck-name { color: var(--warn); }
+.lv-fail .ck-name { color: var(--err); }
+.modal-card .btn-lg { margin-top: 10px; }
 
 /* ==================== 响应式 ==================== */
 @media (min-width: 768px) {
