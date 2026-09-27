@@ -4,7 +4,13 @@
    centerY  ：头部中心的垂直落位（0=顶，1=底）
    topMargin：头顶（含发）到画面上边缘的最小留白比例
    各档 faceRatio 依据对应证件的官方头高区间取值：
-     身份证 / 中国护照 60–70% ｜ 美国签证 50–69% ｜ 申根 70–80% ｜ 其余 60–70% */
+     身份证 / 中国护照 60–70% ｜ 美国签证 50–69% ｜ 申根 70–80% ｜ 其余 60–70%
+   outPx（可选）：**官方文件明文规定的输出像素**。只有这些规格才把像素钉死，
+                  其余规格官方只规定物理尺寸（mm），像素越多越清晰 —— 交由 main.js
+                  按「原图质量」决定（见 deliverLong）。
+     · 身份证   公安部 GA 461-2004《居民身份证制证用数字相片技术要求》：358×441px @350dpi
+     · 学信网   教育部《高等学校学历证书相片信息采集标准》：480×640px，20–40KB
+     · 美国签证 国务院 Digital Image Requirements：600×600 至 1200×1200（取上限更清晰） */
 (function () {
   'use strict';
 
@@ -25,13 +31,13 @@
     s({ id:'two-inch',      name:'二寸',        category:'中国常用', width_mm:35, height_mm:49, width_px:413,  height_px:579,  bg_color:'#FFFFFF', faceRatio:0.68, centerY:0.42, note:'简历、公务员报名' }),
     s({ id:'small-two-inch',name:'小二寸',      category:'中国常用', width_mm:35, height_mm:45, width_px:413,  height_px:531,  bg_color:'#FFFFFF', faceRatio:0.68, centerY:0.42, note:'护照、通行证辅助' }),
     s({ id:'big-two-inch',  name:'大二寸',      category:'中国常用', width_mm:35, height_mm:53, width_px:413,  height_px:626,  bg_color:'#FFFFFF', faceRatio:0.68, centerY:0.42, note:'部分资格证' }),
-    s({ id:'id-card',       name:'身份证',      category:'中国常用', width_mm:26, height_mm:32, width_px:358,  height_px:441,  bg_color:'#FFFFFF', faceRatio:0.65, centerY:0.42, topMargin:0.05, note:'居民身份证（头高约 20mm/32mm = 62%）' }),
+    s({ id:'id-card',       name:'身份证',      category:'中国常用', width_mm:26, height_mm:32, width_px:358,  height_px:441,  bg_color:'#FFFFFF', faceRatio:0.65, centerY:0.42, topMargin:0.05, outPx:[358,441], note:'居民身份证（头高约 20mm/32mm = 62%）' }),
     s({ id:'driver-license',name:'驾驶证',      category:'中国常用', width_mm:22, height_mm:32, width_px:260,  height_px:378,  bg_color:'#FFFFFF', faceRatio:0.68, centerY:0.42, note:'驾驶证申领、换证' }),
     s({ id:'cn-passport',   name:'中国护照',    category:'中国常用', width_mm:33, height_mm:48, width_px:390,  height_px:567,  bg_color:'#FFFFFF', faceRatio:0.65, centerY:0.42, topMargin:0.05, note:'普通护照申请（头高 28–33mm/48mm）' }),
-    s({ id:'chsi',          name:'高考/学信网', category:'中国常用', width_mm:null, height_mm:null, width_px:480, height_px:640, bg_color:'#64C5FF', faceRatio:0.66, centerY:0.45, topMargin:0.06, note:'学信网、阳光高考，浅蓝底' }),
+    s({ id:'chsi',          name:'高考/学信网', category:'中国常用', width_mm:null, height_mm:null, width_px:480, height_px:640, bg_color:'#64C5FF', faceRatio:0.66, centerY:0.45, topMargin:0.06, outPx:[480,640], note:'学信网、阳光高考，浅蓝底（须 20–40KB）' }),
 
     /* ---------- 签证 ---------- */
-    s({ id:'us-visa',       name:'美国签证',    category:'签证', width_mm:51, height_mm:51, width_px:600,  height_px:600,  bg_color:'#FFFFFF', faceRatio:0.62, centerY:0.45, topMargin:0.08, note:'2×2 英寸，头高 1–1⅜ 英寸（50–69%）' }),
+    s({ id:'us-visa',       name:'美国签证',    category:'签证', width_mm:51, height_mm:51, width_px:600,  height_px:600,  bg_color:'#FFFFFF', faceRatio:0.62, centerY:0.45, topMargin:0.08, outPx:[1200,1200], note:'2×2 英寸，头高 1–1⅜ 英寸（50–69%）；官方允许 600–1200px' }),
     s({ id:'schengen-visa', name:'申根签证',    category:'签证', width_mm:35, height_mm:45, width_px:413,  height_px:531,  bg_color:'#FFFFFF', faceRatio:0.75, centerY:0.42, topMargin:0.05, note:'欧洲申根国通用（头高 32–36mm/45mm）' }),
     s({ id:'jp-visa',       name:'日本签证',    category:'签证', width_mm:45, height_mm:45, width_px:531,  height_px:531,  bg_color:'#FFFFFF', faceRatio:0.68, centerY:0.45, note:'45×45mm 正方形' }),
     s({ id:'kr-visa',       name:'韩国签证',    category:'签证', width_mm:35, height_mm:45, width_px:413,  height_px:531,  bg_color:'#FFFFFF', faceRatio:0.68, centerY:0.42, note:'35×45mm' }),

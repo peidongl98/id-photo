@@ -24,42 +24,77 @@
     return TARGETS[0];
   }
 
-  /* 从 0.92 逐步下调到 0.65；压不到就返回实际大小 */
-  function encode(canvas, targetId) {
-    var t = findTarget(targetId);
-    return toBlob(canvas, MAX_Q).then(function (first) {
+  /* 目标档位仍压不到时，逐级缩小尺寸再试（等比，保持规格宽高比）。
+     只有用户显式选了档位才会走到这里 —— 「不限」永远按原图质量原样交付。 */
+  var SCALES = [1, 0.85, 0.72, 0.61, 0.5];
+
+  function shrink(canvas, k) {
+    var w = Math.max(1, Math.round(canvas.width * k));
+    var h = Math.max(1, Math.round(canvas.height * k));
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var x = c.getContext('2d');
+    x.imageSmoothingEnabled = true;
+    x.imageSmoothingQuality = 'high';
+    x.drawImage(canvas, 0, 0, w, h);
+    return c;
+  }
+
+  /* 固定尺寸下：质量从 0.92 逐档下调到 0.65，返回第一个 ≤ max 的 */
+  function encodeAt(cv, t) {
+    return toBlob(cv, MAX_Q).then(function (first) {
       var kb = first.size / 1024;
-      if (t.max === Infinity || kb <= t.max) {
-        return {
-          blob: first, quality: MAX_Q, kb: kb,
-          ok: !(t.min > 0 && kb < t.min),
-          reason: (t.min > 0 && kb < t.min) ? 'under' : 'ok',
-          target: t
-        };
+      if (kb <= t.max) {
+        return { blob: first, quality: MAX_Q, kb: kb,
+                 ok: kb >= t.min, reason: kb >= t.min ? 'ok' : 'under' };
       }
-      var last = { blob: first, quality: MAX_Q };
-      var qs = [];
-      for (var q = +(MAX_Q - STEP).toFixed(4); q > MIN_Q + 1e-9; q = +(q - STEP).toFixed(4)) qs.push(q);
-      qs.push(MIN_Q);
-      var i = 0;
-      function next() {
-        if (i >= qs.length) {
-          return { blob: last.blob, quality: last.quality, kb: last.blob.size / 1024,
-                   ok: false, reason: 'over', target: t };
-        }
-        var qq = qs[i++];
-        return toBlob(canvas, qq).then(function (b) {
-          last = { blob: b, quality: qq };
+      var last = { blob: first, quality: MAX_Q, kb: kb };
+      var q = MAX_Q;
+      function step() {
+        q = +(q - STEP).toFixed(4);
+        if (q < MIN_Q - 1e-9) return { blob: last.blob, quality: last.quality, kb: last.kb, ok: false, reason: 'over' };
+        var qq = Math.max(MIN_Q, q);
+        return toBlob(cv, qq).then(function (b) {
           var size = b.size / 1024;
+          last = { blob: b, quality: qq, kb: size };
           if (size <= t.max) {
             return { blob: b, quality: qq, kb: size,
-                     ok: size >= t.min, reason: size >= t.min ? 'ok' : 'under', target: t };
+                     ok: size >= t.min, reason: size >= t.min ? 'ok' : 'under' };
           }
-          return next();
+          if (qq <= MIN_Q + 1e-9) return { blob: b, quality: qq, kb: size, ok: false, reason: 'over' };
+          return step();
         });
       }
-      return next();
+      return step();
     });
+  }
+
+  /* 不限 → 原图质量（q0.92 原样交付，不动尺寸）
+     选了档位 → 先降质量，仍超再逐级降尺寸 */
+  function encode(canvas, targetId) {
+    var t = findTarget(targetId);
+    if (t.max === Infinity) {
+      return toBlob(canvas, MAX_Q).then(function (b) {
+        return { blob: b, quality: MAX_Q, kb: b.size / 1024, ok: true, reason: 'ok',
+                 target: t, scale: 1, outSize: [canvas.width, canvas.height] };
+      });
+    }
+    var i = 0;
+    function attempt() {
+      if (i >= SCALES.length) return null;
+      var sc = SCALES[i++];
+      var cv = sc === 1 ? canvas : shrink(canvas, sc);
+      return encodeAt(cv, t).then(function (r) {
+        if (r.reason === 'over') {
+          return attempt() || r;          /* 这档压不到 → 换更小的尺寸；到底了就如实回报 */
+        }
+        r.target = t;
+        r.scale = sc;
+        r.outSize = [cv.width, cv.height];
+        return r;
+      });
+    }
+    return attempt();
   }
 
   function stamp() {

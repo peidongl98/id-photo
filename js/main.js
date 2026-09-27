@@ -9,9 +9,19 @@
   var CATS = window.IDP.CATEGORIES;
   var D = window.IDP.SPEC_DEFAULTS;
 
-  var RESULT_LONG_CAP = 1200;  /* 屏幕预览层的长边上限（够屏幕清晰，又不至于太贵） */
-  var ANALYZE_SHORT = 640;     /* 整图 matte 的分析分辨率（MODNet 内部也只会用到 512 短边） */
-  var ANALYZE_LONG_CAP = 1280;
+  /* ---------- 交付像素策略 ----------
+     规格库里的 width_px/height_px 是「300dpi 换算值」，**只有三个规格是官方明文规定的**：
+       身份证 358×441（GA 461-2004）、学信网 480×640（教育部采集标准）、
+       美国签证 600–1200（国务院 Digital Image Requirements）
+     它们由规格的 outPx 字段钉死。其余规格官方只规定物理尺寸（mm），
+     像素本身不作要求 —— 那就按「原图质量」交付：直接用裁剪区的原始像素，
+     不做任何降采样（旧行为把 880×1132 压到 413×531，细节只剩 46%）。
+     用户显式选了「目标文件大小」档位时才牺牲清晰度，见 export.js 的缩尺寸逻辑。 */
+  var OUTPUT_LONG_CAP = 1800;  /* 交付层长边硬上限：防超大原图导致逐像素合成过慢 */
+  var ANALYZE_SHORT = 1024;    /* 整图 matte 的分析分辨率。**必须 ≥ bgRemove 的 SEG_SHORT**，
+                                  否则这里是瓶颈：交付 880px 宽时，512 级 matte 在裁剪区只有 ~282px，
+                                  发丝 alpha 被放大 3.1× → 头发高频只剩 57%。 */
+  var ANALYZE_LONG_CAP = 2048;
   var JOB_TIMEOUT = 15000;     /* 处理超时 */
   var RERENDER_DEBOUNCE = 300; /* 结果视图调参重算的 debounce */
   var MAX_KB_CANVAS = 16000000;
@@ -24,7 +34,7 @@
     master: null, face: null, fileName: '',
     cat: CATS[0], spec: SPECS[0],
     bg: SPECS[0].bg_color,
-    intensity: 0.22, radius: 3,
+    intensity: 0.12, radius: 3,
     target: 'none', customUnit: 'mm',
     zoom: 1, offsetX: 0, offsetY: 0, centerY: null,
     rect: null, dragging: false,
@@ -246,27 +256,26 @@
   }
 
   /* ================= 生成结果（复用分析阶段的 matte，不重跑模型） ================= */
-  function viewDeviceLong() {
-    var w = el.viewwrap.clientWidth, h = el.viewwrap.clientHeight;
-    if (!w || !h) {
-      w = Math.max(240, Math.min(window.innerWidth, 620) - 24);
-      h = clamp(window.innerHeight * 0.52, 190, 540);
+  /* 交付层长边：
+     · 规格带 outPx（官方明文像素）→ 用 outPx 长边；
+     · 其余 → 用裁剪区的原始像素（原图质量，零降采样）；
+     两条硬约束：不低于规格像素（不无故缩小）、不超过 OUTPUT_LONG_CAP；
+     且不超过裁剪源自身的像素（再往上只是插值，没有新细节）。
+     屏幕预览直接用这一层（所见即所得），所以不再单独算一层。 */
+  function deliverLong() {
+    var sp = specFor();
+    var specLong = Math.max(sp.width_px, sp.height_px);
+    var need = specLong;
+    if (sp.outPx) {
+      need = Math.max(sp.outPx[0], sp.outPx[1]);
+    } else if (state.rect) {
+      need = Math.round(Math.max(state.rect.w, state.rect.h));
     }
-    var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    return Math.max(w, h) * dpr;
-  }
-  /* 结果层长边：不小于规格像素（保证「所见即所得」的下限），也不小于屏幕实际需要，
-     且不超过裁剪源本身的像素（避免无意义的放大）。规格本身超过上限时不缩——预览不能比
-     交付文件还差。 */
-  function resultLong() {
-    var specLong = Math.max(state.spec.width_px, state.spec.height_px);
-    var need = Math.max(specLong, Math.round(viewDeviceLong()));
-    if (specLong <= RESULT_LONG_CAP) need = Math.min(need, RESULT_LONG_CAP);
     if (state.rect) {
       var srcLong = Math.max(state.rect.w, state.rect.h);
       need = Math.min(need, Math.max(specLong, Math.round(srcLong)));
     }
-    return need;
+    return Math.max(specLong, Math.min(need, OUTPUT_LONG_CAP));
   }
   function alphaFor(rect, base) {
     var sA = state.matteW / state.master.width;
@@ -318,23 +327,12 @@
       .then(function (ok) { return ok ? r : null; });
   }
 
-  /* 预览层（屏幕清晰）+ 交付层（规格原始像素）。两层共用同一份 alpha，都不重跑模型。 */
-  function renderBoth(onStage, job) {
-    var plong = resultLong();
-    return computeResult(plong, onStage, job).then(function (r) {
-      if (!r) return null;
-      r.full = null;
-      if (r.canvas.width === state.spec.width_px && r.canvas.height === state.spec.height_px) return r;
-      return computeResult(null, onStage, job).then(function (f) {
-        if (f) r.full = f;
-        return r;
-      });
-    });
+  /* 只渲染一层：它既是屏幕预览，也是下载交付件（所见即所得，不重跑模型） */
+  function renderOnce(onStage, job) {
+    return computeResult(deliverLong(), onStage, job);
   }
   function resultCanvas() {
-    var r = state.result;
-    if (!r) return null;
-    return (r.full && r.full.canvas) || r.canvas;
+    return state.result ? state.result.canvas : null;
   }
 
   function beginJob(text) {
@@ -371,7 +369,7 @@
       return;
     }
     var stage = function (t) { if (state.job === job) { el.mainAction.textContent = t; busy(true, t); } };
-    renderBoth(stage, job)
+    renderOnce(stage, job)
       .then(function (r) {
         var timedOut = job.timedOut;
         finishJob(job);
@@ -426,24 +424,6 @@
         return step(job, function () {
           r.canvas = window.IDP.Mopi.apply(r.composed, {
             intensity: state.intensity, radius: state.radius, mask: r.mask
-          });
-        });
-      })
-      .then(function (ok) {
-        /* 交付层同步重算（规格很小，代价可忽略；预览即规格时跳过） */
-        if (!ok || !r.full) return ok;
-        return step(job, function () {
-          var f = r.full;
-          if (f.composed && f.bgUsed === state.bg) return;
-          f.composed = window.IDP.BgRemove.composite(f.base, f.alpha, state.bg);
-          f.bgUsed = state.bg;
-        }).then(function (ok2) {
-          if (!ok2) return false;
-          return step(job, function () {
-            var f = r.full;
-            f.canvas = window.IDP.Mopi.apply(f.composed, {
-              intensity: state.intensity, radius: state.radius, mask: f.mask
-            });
           });
         });
       })
@@ -822,8 +802,11 @@
     el.customSpec.hidden = true; el.specRow.hidden = false;
     var list = SPECS.filter(function (s) { return s.category === state.cat; });
     el.specRow.innerHTML = list.map(function (s) {
-      var dim = s.width_mm ? s.width_mm + '×' + s.height_mm + 'mm · ' + s.width_px + '×' + s.height_px + 'px'
-                           : s.width_px + '×' + s.height_px + 'px';
+      /* 官方明文规定像素的规格显示「固定 xxx px」；其余只规定物理尺寸，像素按原图质量给 */
+      var px = s.outPx
+        ? '固定 ' + s.outPx[0] + '×' + s.outPx[1] + 'px'
+        : '按原图质量';
+      var dim = s.width_mm ? s.width_mm + '×' + s.height_mm + 'mm · ' + px : px;
       return '<button type="button" class="spec' + (s.id === state.spec.id ? ' is-on' : '') + '" data-id="' + s.id + '">' +
         '<div class="spec-name">' + s.name + '</div>' +
         '<div class="spec-size">' + dim + '</div>' +
@@ -837,14 +820,33 @@
     });
     var cur = SPECS.filter(function (s) { return s.id === state.spec.id; })[0];
     el.specHint.textContent = cur
-      ? (cur.note || '') + '　构图：头部 ' + (cur.faceRatio * 100).toFixed(0) + '% / 居中 ' + cur.centerY + ' / 头顶留白 ' + (cur.topMargin * 100).toFixed(0) + '%'
+      ? (cur.note || '') + '　构图：头部 ' + (cur.faceRatio * 100).toFixed(0) + '% / 居中 ' + cur.centerY + ' / 头顶留白 ' + (cur.topMargin * 100).toFixed(0) + '%' +
+        (cur.outPx ? '　交付像素由官方文件固定为 ' + cur.outPx[0] + '×' + cur.outPx[1] + 'px' : '')
       : '';
+  }
+
+  /* 目标大小档位：不限 = 按原图质量交付；选档位才会为命中体积压低质量/尺寸 */
+  function renderSizeChips() {
+    el.sizeChips.innerHTML = window.IDP.Export.TARGETS.map(function (t) {
+      return '<button type="button" class="chip' + (t.id === state.target ? ' is-on' : '') + '" data-id="' + t.id + '">' +
+        t.name + (t.note ? '（' + t.note + '）' : '') + '</button>';
+    }).join('');
+    Array.prototype.forEach.call(el.sizeChips.children, function (b) {
+      b.addEventListener('click', function () {
+        state.target = b.dataset.id;
+        Array.prototype.forEach.call(el.sizeChips.children, function (x) { x.classList.remove('is-on'); });
+        b.classList.add('is-on');
+        refreshExportInfo();
+      });
+    });
   }
 
   function selectSpec(s) {
     if (state.view === 'result') return;      /* 规格只在裁剪视图可改 */
     state.spec = s;
     if (s.bg_color) setBg(s.bg_color, true);
+    /* 学信网官方明文要求 20–40KB，未指定档位时自动带上，避免交付件被系统退 */
+    if (s.id === 'chsi' && state.target === 'none') { state.target = 'chsi'; renderSizeChips(); }
     resetComposition();
     renderSpecRow();
     refreshRect();                            /* 复用已算好的 matte 与人脸点，只重算裁剪框 */
@@ -936,18 +938,7 @@
     });
 
     /* 目标大小 */
-    el.sizeChips.innerHTML = window.IDP.Export.TARGETS.map(function (t) {
-      return '<button type="button" class="chip' + (t.id === state.target ? ' is-on' : '') + '" data-id="' + t.id + '">' +
-        t.name + (t.note ? '（' + t.note + '）' : '') + '</button>';
-    }).join('');
-    Array.prototype.forEach.call(el.sizeChips.children, function (b) {
-      b.addEventListener('click', function () {
-        state.target = b.dataset.id;
-        Array.prototype.forEach.call(el.sizeChips.children, function (x) { x.classList.remove('is-on'); });
-        b.classList.add('is-on');
-        refreshExportInfo();
-      });
-    });
+    renderSizeChips();
 
     el.downloadBtn.addEventListener('click', function () { doDownload(false); });
 
@@ -1070,17 +1061,21 @@
     clearTimeout(exportTimer);
     exportTimer = setTimeout(function () {
       if (state.view !== 'result' || !state.result) { notice(el.exportNotice, ''); return; }
-      var c = resultCanvas();                 /* 规格原始像素，估算即实测 */
+      var c = resultCanvas();                 /* 交付层，估算即实测 */
       if (!c) return;
       window.IDP.Export.encode(c, state.target).then(function (info) {
         state.exportInfo = info;
         var t = info.target;
-        var msg = '当前导出 ' + info.kb.toFixed(1) + ' KB（' +
-          c.width + '×' + c.height + 'px，质量 ' + info.quality.toFixed(2) + '）';
+        var os = info.outSize || [c.width, c.height];
+        var msg = '交付 ' + os[0] + '×' + os[1] + 'px，' + info.kb.toFixed(1) + ' KB（质量 ' + info.quality.toFixed(2) + '）';
         if (t.max !== Infinity) msg += '，目标 ' + t.min + '–' + t.max + ' KB';
         var kind = 'ok';
+        if (info.scale && info.scale < 1) {
+          msg += ' —— 为命中目标已把尺寸缩到 ' + Math.round(info.scale * 100) + '%';
+          kind = 'warn';
+        }
         if (state.target !== 'none' && !info.ok && info.reason === 'over') {
-          msg += ' —— 已压到最低质量仍超出，可直接下载但不满足目标'; kind = 'err';
+          msg += ' —— 已压到最低质量与最小尺寸仍超出，可直接下载但不满足目标'; kind = 'err';
         }
         if (state.target !== 'none' && !info.ok && info.reason === 'under') {
           msg += ' —— 低于目标下限，官方系统可能拒收小文件'; kind = 'warn';
@@ -1319,8 +1314,8 @@
     cancel: cancelRunning,
     runFull: function () {
       if (!state.rect) return Promise.resolve(null);
-      return computeResult(null, function () { }, { cancelled: false }).then(function (r) {
-        if (r) { state.fullCanvas = r.canvas; if (state.result) state.result.full = r; }
+      return computeResult(deliverLong(), function () { }, { cancelled: false }).then(function (r) {
+        if (r) state.fullCanvas = r.canvas;
         return r ? r.canvas : null;
       });
     },
@@ -1328,8 +1323,8 @@
     timings: function () { return state.result ? state.result.timings : null; },
     openZoom: openZoom, closeZoom: closeZoom,
     gotoState: gotoState,
-    resultLong: resultLong,
-    /* long=null → 规格原始像素；返回 {data,w,h}（w/h 为真实画布尺寸，勿用 long 推算） */
+    resultLong: deliverLong,
+    /* 返回 {data,w,h}（w/h 为真实画布尺寸，勿用 long 推算） */
     alphaForRect: function (long) {
       var base = window.IDP.Crop.renderCrop(state.master, state.rect, specFor(), long == null ? null : long);
       return { data: alphaFor(state.rect, base), w: base.width, h: base.height };

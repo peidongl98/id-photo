@@ -19,7 +19,9 @@
   function setModnetBuffer(buf) {
     if (buf && buf.byteLength) _modnetBuffer = buf;
   }
-  var SEG_SHORT = 512, SEG_LONG_CAP = 1024;
+  /* MODNet 输入短边。512 时整理 matte 只有 512 级信息量，交付到 880px 宽会把发丝放大 3.1× 拉糊，
+     故与 main.js 的 ANALYZE_SHORT 一起提到 1024。 */
+  var SEG_SHORT = 1024, SEG_LONG_CAP = 2048;
 
   var _ortP = null, _session = null, _modnetP = null, _seg = null, _segP = null;
 

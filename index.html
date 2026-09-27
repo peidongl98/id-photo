@@ -131,8 +131,8 @@
       <h2 class="group-title">磨皮强度</h2>
       <div class="slider-row">
         <label for="intenSlider">强度</label>
-        <input type="range" id="intenSlider" min="0" max="30" step="1" value="22">
-        <output id="intenOut">22%</output>
+        <input type="range" id="intenSlider" min="0" max="30" step="1" value="12">
+        <output id="intenOut">12%</output>
       </div>
       <div class="slider-row">
         <label for="radiusSlider">平滑半径</label>
@@ -147,7 +147,7 @@
     <section class="group">
       <h2 class="group-title">目标文件大小</h2>
       <div class="chips" id="sizeChips"></div>
-      <p class="hint" id="sizeHint">按目标大小自动调节 JPEG 质量（0.92 → 0.65）</p>
+      <p class="hint" id="sizeHint">不限 = 按原图质量交付（不缩尺寸）；选档位才会为命中体积先降质量、必要时再降尺寸</p>
     </section>
 
     <p class="hint prehint" id="preHint">背景色和磨皮将在预生成后生效</p>

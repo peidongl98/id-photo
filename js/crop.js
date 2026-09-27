@@ -161,6 +161,16 @@
     if (ex - sx < 1 || ey - sy < 1) return out;   /* 完全在画外 */
 
     var kx = W / rect.w, ky = H / rect.h;
+    /* 交付尺寸 ≈ 裁剪区原始尺寸时（「按原图质量」的常规情形），
+       走 drawImage 的缩放分支会让 Chrome 按亚像素插值，白白软化一层
+       —— 实测衣领织物这种纯前景、不经磨皮的区域也只有 87% 高频。
+       这里关掉平滑、按整数像素直取，1:1 拿到原样细节。 */
+    var bw = ex - sx, bh = ey - sy;
+    if (Math.abs(bw - W) <= 1 && Math.abs(bh - H) <= 1) {
+      oc.imageSmoothingEnabled = false;
+      oc.drawImage(master, sx, sy, bw, bh, 0, 0, W, H);
+      return out;
+    }
     oc.imageSmoothingEnabled = true;
     oc.imageSmoothingQuality = 'high';
     oc.drawImage(master, sx, sy, ex - sx, ey - sy,
