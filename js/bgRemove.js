@@ -340,15 +340,16 @@
     return p.then(function (r) {
       var m = r.m;
       var alpha = (m.w === w && m.h === h) ? m.data : bilinear(m.data, m.w, m.h, w, h);
-      /* 轻微拉伸对比度，压掉背景上的低位残留（MODNet 用更轻的曲线保住软边） */
-      var lo = r.engine === 'modnet' ? 0.03 : 0.0, hi = r.engine === 'modnet' ? 0.97 : 1.0;
+      /* 对比度拉伸：把半透明带收窄，轮廓才硬（参数可调，见文件顶部 params） */
+      var lo = r.engine === 'modnet' ? params.alphaLo : 0.0;
+      var hi = r.engine === 'modnet' ? params.alphaHi : 1.0;
       var span = hi - lo;
       for (var i = 0; i < alpha.length; i++) {
         var a = (alpha[i] - lo) / span;
         alpha[i] = a < 0 ? 0 : (a > 1 ? 1 : a);
       }
       var img = canvas.getContext('2d').getImageData(0, 0, w, h);
-      alpha = refine(alpha, img.data, w, h, 2, 2, 0.09);
+      alpha = refine(alpha, img.data, w, h, params.rRadius, params.rIters, params.rSigma);
       return { alpha: alpha, w: w, h: h, engine: r.engine, modnetError: r.modnetError };
     });
   }
@@ -360,6 +361,21 @@
     return [parseInt(s.slice(0, 2), 16) || 0, parseInt(s.slice(2, 4), 16) || 0, parseInt(s.slice(4, 6), 16) || 0];
   }
 
+  /* 合成/抠图参数
+     spill       去溢色强度：0 = 旧行为（观测值再乘一次 alpha，发丝发灰）；
+                 0.85 = 对着原背景色反解前景真色
+     spillMinA   参与反解的最小 alpha（防低 alpha 处放大噪声）
+     alphaLo/Hi  matte 对比度拉伸区间。收窄它才能把「人像轮廓外的灰色晕影」压掉：
+                 实测头发上缘过渡带 20.0→15.0 原图 px、脸颊轮廓 15.0→10.0 px，
+                 再窄到 0.20–0.80 会把真实飞发削掉（观感像剪出来）。
+     rRadius/rIters/rSigma  联合双边精修（吸附到图像真实边缘）。实测对过渡带宽度无影响，
+                 只做平滑，故保持较轻的 3/4/0.05。 */
+  var params = {
+    spill: 0.85, spillMinA: 0.12,
+    alphaLo: 0.12, alphaHi: 0.88,
+    rRadius: 3, rIters: 4, rSigma: 0.05
+  };
+
   function composite(canvas, alpha, bgHex) {
     var w = canvas.width, h = canvas.height;
     var ctx = canvas.getContext('2d');
@@ -368,16 +384,19 @@
     var out = new Uint8ClampedArray(w * h * 4);
     var RAD = 4;
 
-    function coreColor(idx) {
+    /* 邻近「原背景色」＝ (2RAD+1)² 邻域内 alpha≈0 的像素均值。
+       去溢色要对着它反解，不能用邻近前景色 —— 用前景色等于把发丝往实心头发上拽，
+       边缘会整体变淡。 */
+    function bgColorAt(idx) {
       var x = idx % w, y = (idx / w) | 0;
       var cr = 0, cg = 0, cb = 0, n = 0;
       var xlo = Math.max(0, x - RAD), xhi = Math.min(w - 1, x + RAD);
       var ylo = Math.max(0, y - RAD), yhi = Math.min(h - 1, y + RAD);
       for (var yy = ylo; yy <= yhi; yy++) for (var xx = xlo; xx <= xhi; xx++) {
         var j = yy * w + xx;
-        if (alpha[j] > 0.92) { var t = j * 4; cr += src[t]; cg += src[t + 1]; cb += src[t + 2]; n++; }
+        if (alpha[j] <= 0.05) { var t = j * 4; cr += src[t]; cg += src[t + 1]; cb += src[t + 2]; n++; }
       }
-      return n ? [cr / n, cg / n, cb / n] : null;
+      return n >= 3 ? [cr / n, cg / n, cb / n] : null;
     }
 
     for (var i = 0; i < w * h; i++) {
@@ -387,11 +406,15 @@
       } else if (a <= 0.005) {
         out[o] = bg[0]; out[o + 1] = bg[1]; out[o + 2] = bg[2]; out[o + 3] = 255;
       } else {
+        /* 观测值 = a·F + (1-a)·B_原背景，其中 F 是前景真色。
+           ⚠ 不能直接把观测值再乘一次 a —— 那等于把前景变成 a²F，发丝边缘会被再压淡一层。
+           先按上式反解出 F，再合成到新背景。 */
         var r = src[o], g = src[o + 1], b = src[o + 2];
-        var core = coreColor(i);
-        if (core) {
-          var kk = 0.85 * (1 - a);
-          r += (core[0] - r) * kk; g += (core[1] - g) * kk; b += (core[2] - b) * kk;
+        var ob = bgColorAt(i);
+        if (ob && params.spill > 0) {
+          var a2 = a < params.spillMinA ? params.spillMinA : a;
+          var k = (1 - a) / a2 * params.spill;
+          r += (r - ob[0]) * k; g += (g - ob[1]) * k; b += (b - ob[2]) * k;
         }
         out[o] = r * a + bg[0] * (1 - a);
         out[o + 1] = g * a + bg[1] * (1 - a);
@@ -457,6 +480,9 @@
     isModnetReady: function () { return !!_session; },
     segment: segment,
     composite: composite,
+    /* 去溢色强度：0 = 旧行为（观测值再乘一次 alpha，发丝发灰发糊）；0.85 = 对着原背景反解前景 */
+    params: params,
+    setParams: function (o) { for (var k in o) if (Object.prototype.hasOwnProperty.call(params, k)) params[k] = o[k]; },
     sampleMatte: sampleMatte,
     hexToRgb: hexToRgb,
     foregroundRatio: foregroundRatio,
