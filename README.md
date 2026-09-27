@@ -5,11 +5,16 @@
 - 线上地址：https://id-photo-3kh.pages.dev
 - 仓库：https://github.com/peidongl98/id-photo
 
+> 变更为「启动页 + 三态 + 显示区/校验概要/操作区」的三段式布局：
+> 打开先过启动页（两个模型并行加载、实时进度、最短 1 秒），再进入主界面；
+> 未上传时显示区是大上传框，上传后才出现图片与校验概要行。
+
 ## 功能
 
 | 模块 | 说明 |
 |---|---|
-| 上传 | 点击 / 拖拽 / 粘帖 / 手机拍照；JPG、PNG、HEIC；按 EXIF 方向自动摆正 |
+| 启动页 | 每次访问都显示；两个模型并行下载 + 实时进度 + 阶段文字；最短 1 秒；失败可重试 3 次 |
+| 上传 | 未上传时显示区是大虚线上传框（点击 / 拖拽 / 粘帖 / 手机拍照）；JPG、PNG、HEIC；按 EXIF 方向自动摆正 |
 | 人脸检测 | MediaPipe Face Landmarker（468 关键点），自动算裁剪框 |
 | 拖动调参 | 直接拖动取景框移动构图，滚轮 / 双指缩放；拖动零延迟（纯几何，不重算），松手 300ms 后出低分辨率预览 |
 | 双层处理 | 预览层最长边 600px（拖动结束 300ms 触发）；输出层原分辨率（只在点下载时跑，带进度条） |
@@ -17,7 +22,7 @@
 | 构图约束 | 头顶留白 ≥ topMargin（低于自动下拉）、下巴到画面下边 ≥ 10%，头顶绝不出框 |
 | 换底 | **MODNet**（ONNX + onnxruntime-web，连续 alpha matte，发丝自然）→ 失败自动降级 MediaPipe Selfie Segmentation；含溢色去除与联合双边蒙版精修 |
 | 磨皮 | 自写 WebGL 双边滤波，只作用于人脸椭圆；强度 0–30%（硬上限），平滑半径 1–5px |
-| 合规检测 | 人脸检测 / 人脸居中 / 五官比例 / 亮度 / 背景纯色 / 磨皮强度，三级结论 + 颜色·图标·文字三重编码 |
+| 校验 | 概要行常驻一行（✅ 符合规范 / ⚠ N 项警告 / ✗ N 项不通过），点击弹出浮层逐项列出六项检测，调参实时更新 |
 | 导出 | JPEG 0.92→0.65 自动下调；目标大小（不限 / 20–40KB 学信网 / 40–100KB / 100–200KB） |
 
 ## 处理顺序
@@ -41,12 +46,16 @@
   - `@mediapipe/tasks-vision@0.10.14`（jsdelivr 主 + unpkg 备，自动回退）
   - `onnxruntime-web@1.20.0`（MODNet 运行时；`numThreads=1`，不依赖 COOP/COEP）
   - `heic2any@0.0.4`（HEIC 转换，按需注入）
-- 模型文件**本地同源托管**（`assets/models/`）：
-  - `face_landmarker.task` 3.6MB（人脸关键点）
-  - `modnet.onnx` 6.6MB（高精度抠图）
-  - `selfie_segmenter.tflite` 244KB（降级抠图）
-  - 原因：官方源是 `storage.googleapis.com` / `huggingface.co`，中国大陆不可直连；同源托管同时更快。
-- 按需加载：打开页面只加载人脸检测模型；**MODNet 只在用户点「高精度抠图」时下载**（带进度条），之后由 HTTP 缓存。
+- 模型文件**本地同源托管**（`/models/`）：
+  - `face_landmarker.task` 3.58 MiB（MediaPipe Face Landmarker 原版）
+  - `modnet.onnx` 24.69 MiB（MODNet **fp32 原始 ONNX，未量化**）
+  - `selfie_segmenter.tflite` 0.24 MiB（降级抠图）
+  - 24.69 MiB < Cloudflare Pages 单文件上限 25 MiB（已用真实部署预检确认）
+  - 原因：官方源是 `storage.googleapis.com` / `huggingface.co`，中国大陆不可直连
+- **加载策略**：两个模型在启动页统一加载，并行下载、fetch + stream 实时进度；不依赖任何用户点击。
+- `_headers` 给 `/models/*` 打 `Cache-Control: public, max-age=31536000, immutable`；
+  `sw.js` 提供应用外壳预缓存 + 模型缓存优先 + 外部 CDN 运行时缓存，`VERSION` 常量管版本、自动清旧缓存。
+  页面侧同时把下载好的模型写回 Cache Storage，二次访问模型**零网络请求**。
 
 ## 各规格构图参数
 
@@ -123,10 +132,14 @@ npx wrangler pages deploy . --project-name=id-photo --branch=main
 
 ```
 IDPhoto/
-├── index.html
-├── css/style.css            含抽屉式移动端排版
+├── index.html               启动页 + 主界面（显示区 / 校验概要行 / 操作区）
+├── _headers                 /models/* 强缓存头（Cloudflare Pages 自动识别）
+├── sw.js                    Service Worker：外壳预缓存 + 模型强缓存 + 版本管理
+├── models/                  face_landmarker.task / modnet.onnx / selfie_segmenter.tflite
+├── css/style.css
 ├── js/
-│   ├── main.js              主流程 / 拖动调参 / 双层处理 / 抽屉
+│   ├── preload.js           模型并行下载 + 实时进度 + Cache Storage
+│   ├── main.js              主流程 / 启动页 / 三态 / 拖动调参 / 双层处理 / 校验浮层
 │   ├── faceDetect.js        Face Landmarker
 │   ├── bgRemove.js          MODNet + 降级 + 蒙版精修 + 溢色去除
 │   ├── mopi.js              WebGL 双边滤波（含 CPU 兜底）
@@ -134,7 +147,6 @@ IDPhoto/
 │   ├── compliance.js        六项合规检测
 │   └── export.js            质量自适应导出
 ├── data/specs.js            23 档规格 + 独立构图参数
-├── assets/models/           MediaPipe + MODNet 模型（本地托管）
 └── .github/workflows/deploy.yml
 ```
 
