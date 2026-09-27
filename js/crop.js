@@ -4,7 +4,53 @@
 
   var MASTER_LONG = 3600;      /* 长边上限，3600×3600 ≈ 13MP，留足 iOS 16MP 余量 */
   var CHIN_MIN = 0.10;         /* 下巴到画面下边缘的最小留白 */
+  var MATTE_FG = 0.40;         /* 判定「这是头发/人像」的 alpha 阈值 */
+  var MATTE_ROW = 0.04;        /* 该行至少要有这个比例的前景像素，才认作头顶 */
+  var MATTE_XSPAN = 0.40;      /* 扫描横带 = 人脸框左右各外扩 40% 脸宽（头发通常比脸宽） */
+
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  /* ---------- 头顶（含发）定位 ----------
+     人脸框（Face Landmarker 的 468 点轮廓）只到发际线，不含头发。
+     在人脸横带内自上而下扫 alpha matte，第一个有效前景行就是真正的头顶。 */
+  function headTopFromMatte(face, matte, mw, mh) {
+    var ob = face.ovalBox;
+    var x0 = clamp(ob.x - ob.w * MATTE_XSPAN, 0, 1);
+    var x1 = clamp(ob.x + ob.w * (1 + MATTE_XSPAN), 0, 1);
+    var ix0 = Math.max(0, Math.floor(x0 * mw));
+    var ix1 = Math.min(mw, Math.ceil(x1 * mw));
+    var span = ix1 - ix0;
+    if (span < 3 || !matte) return null;
+
+    var need = Math.max(2, Math.round(span * MATTE_ROW));
+    /* 上界保护：不认 1.5 倍脸高以上才出现的前景，避免抓到背景杂物 */
+    var yStart = Math.max(0, Math.floor((ob.y - ob.h * 1.5) * mh));
+    for (var y = yStart; y < mh; y++) {
+      var row = y * mw, n = 0;
+      for (var x = ix0; x < ix1; x++) {
+        if (matte[row + x] > MATTE_FG) { n++; if (n >= need) break; }
+      }
+      if (n >= need) return y / mh;
+    }
+    return null;
+  }
+
+  /* 把 face.head 换成「头顶含发 → 下巴」的完整头部（cx/cy/h 语义不变，下游无需改） */
+  function withHairHead(face, matte, mw, mh) {
+    var ob = face.ovalBox;
+    var chin = ob.y + ob.h;
+    var found = matte ? headTopFromMatte(face, matte, mw, mh) : null;
+    var fb = ob.y - ob.h * 0.15;                  /* 拿不到 matte 时退回「发际线上扩 15%」 */
+    var top = found == null ? fb : Math.min(found, ob.y);
+    var h = Math.max(ob.h, chin - top);
+    var head = { cx: ob.x + ob.w / 2, w: ob.w * 1.25, h: h, cy: (chin + top) / 2 };
+    return {
+      count: face.count, lm: face.lm, oval: face.oval,
+      ovalBox: ob, head: head,
+      headTop: top, hairTop: found, chin: chin,
+      hairHeight: top < ob.y ? (ob.y - top) : 0      /* 发际线以上的头发高度（归一化） */
+    };
+  }
 
   /* 把 ImageBitmap / HTMLImageElement 落到一张受控尺寸的 master canvas */
   function loadMaster(img) {
@@ -180,6 +226,8 @@
     renderCrop: renderCrop,
     makeFaceMask: makeFaceMask,
     faceMetrics: faceMetrics,
+    headTopFromMatte: headTopFromMatte,
+    withHairHead: withHairHead,
     CHIN_MIN: CHIN_MIN
   };
 })();
